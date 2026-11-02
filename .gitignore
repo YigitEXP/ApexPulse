@@ -1,0 +1,26 @@
+# Gradle / Android
+.gradle/
+build/
+app/build/
+*.iml
+.idea/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Gizli bilgiler
+*.jks
+*.keystore
+keystore.properties
+app/google-services.json
+
+# Firebase CLI
+.firebase/
+firebase-debug.log
+*-debug.log
+.firebaserc
+
+# OS
+.DS_Store
+Thumbs.db

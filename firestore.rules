@@ -1,0 +1,252 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// This security rules file assumes the following data structures:
+//
+// Collection: leaderboard
+// Document ID: {userId} (matches Firebase Auth UID)
+// Fields:
+//   - userId: string (required, immutable, == request.auth.uid) - Owner's Firebase Auth UID
+//   - username: string (required, 2..32 chars) - Public display name
+//   - handle: string (required, 2..36 chars) - Public driver handle (e.g., @driver)
+//   - totalMiles: int | float (required, 0..1000000) - Total distance driven in miles
+//   - totalHours: int | float (required, 0..50000) - Total seat time in hours
+//   - totalDrives: int (required, 0..100000) - Total completed drive count
+//   - safetyScore: int (required, 0..100) - Aggregate safety score
+//   - mechanicalHealthScore: int (required, 0..100) - Aggregate mechanical health score
+//   - driverPersonaTag: string (required, enum) - One of ECO_MASTER, REDLINE_MONSTER, CLUTCH_NEMESIS, SMOOTH_OPERATOR
+//   - updatedAt: timestamp (required, == request.time) - Server timestamp of last leaderboard sync
+//
+// Collection: users/{userId}/drives
+// Document ID: {driveId}
+// Fields:
+//   - startTimeEpochMs: int (required, immutable, > 0) - Drive start timestamp in epoch milliseconds
+//   - distanceMeters: int | float (required, 0..5000000) - Total drive distance in meters
+//   - durationMs: int (required, 0..604800000) - Total drive duration in milliseconds
+//   - safetyScore: int (required, 0..100) - Calculated drive safety score
+//   - avgRpm: int (required, 0..20000) - Average engine RPM during the drive
+//   - mostUsedGear: int (required, 0..10) - Most frequently engaged transmission gear (0=N, 1..6+)
+//   - clutchSlipCount: int (required, 0..10000) - Number of detected clutch slip / friction events
+//   - mechanicalWearScore: int (required, 0..100) - Calculated mechanical wear score (0=no wear, 100=severe wear)
+//   - driverPersonaTag: string (required, enum) - One of ECO_MASTER, REDLINE_MONSTER, CLUTCH_NEMESIS, SMOOTH_OPERATOR
+//   - vehicleFullHierarchyName: string (required, 1..160 chars) - Full hierarchy label of the vehicle used
+//   - driveId: int (optional, immutable, >= 0) - Local Room primary key identifier
+//   - vehicleId: string (optional, 1..80 chars) - Garage vehicle identifier
+//   - vehicleCategory: string (optional, enum: AUTOMOBILE, MOTORCYCLE) - Vehicle category
+//   - placementMode: string (optional, enum: MOUNTED_HOLDER, LOOSE_CONSOLE) - Phone placement mode
+//   - endTimeEpochMs: int (optional, >= startTimeEpochMs) - Drive completion timestamp in epoch milliseconds
+//   - avgSpeedKmh: int | float (optional, 0..500) - Average speed in km/h
+//   - maxSpeedKmh: int | float (optional, 0..500) - Maximum speed in km/h
+//   - maxRpm: int (optional, 0..20000) - Peak engine RPM recorded
+//   - avgEngineLoadPct: int | float (optional, 0..100) - Average OBD-II engine load percentage
+//   - hardBrakeCount: int (optional, 0..10000) - Count of hard braking events
+//   - rapidAccelCount: int (optional, 0..10000) - Count of rapid acceleration events
+//   - sharpTurnCount: int (optional, 0..10000) - Count of sharp cornering events
+//   - isOngoing: bool (optional) - Whether the drive session is still active
+//   - updatedAt: timestamp (optional, == request.time) - Server sync timestamp
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    // Check if the user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Check if user owns the resource (for user-scoped documents)
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Validate required fields exist on the incoming document
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    // Validate that the document contains only the allowed fields (no schema pollution)
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // Validate that immutable fields have not been modified on update
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // Validate string type and character length bounds
+    function validStringLength(field, minLen, maxLen) {
+      return request.resource.data[field] is string &&
+             request.resource.data[field].size() >= minLen &&
+             request.resource.data[field].size() <= maxLen;
+    }
+
+    // Validate optional string (if present, must be string and within length bounds)
+    function isValidOptionalString(field, minLen, maxLen) {
+      return !(field in request.resource.data) ||
+             (request.resource.data[field] is string &&
+              request.resource.data[field].size() >= minLen &&
+              request.resource.data[field].size() <= maxLen);
+    }
+
+    // Validate numeric value (int or float) within [minVal, maxVal]
+    function isValidNumberRange(val, minVal, maxVal) {
+      return (val is int || val is float) && val >= minVal && val <= maxVal;
+    }
+
+    // Validate integer value within [minVal, maxVal]
+    function isValidIntRange(val, minVal, maxVal) {
+      return val is int && val >= minVal && val <= maxVal;
+    }
+
+    // Validate DriverPersonaTag enum values
+    function isValidPersonaTag(tag) {
+      return tag is string &&
+             tag in ['ECO_MASTER', 'REDLINE_MONSTER', 'CLUTCH_NEMESIS', 'SMOOTH_OPERATOR'];
+    }
+
+    // ===============================================================
+    // Domain Validators (Used in BOTH create and update)
+    // ===============================================================
+
+    function isValidLeaderboardEntry(data, userId) {
+      let allowedFields = [
+        'userId',
+        'username',
+        'handle',
+        'totalMiles',
+        'totalHours',
+        'totalDrives',
+        'safetyScore',
+        'mechanicalHealthScore',
+        'driverPersonaTag',
+        'updatedAt'
+      ];
+      return hasOnlyAllowedFields(allowedFields) &&
+             hasRequiredFields(allowedFields) &&
+             data.userId is string &&
+             data.userId == request.auth.uid &&
+             data.userId == userId &&
+             validStringLength('username', 2, 32) &&
+             validStringLength('handle', 2, 36) &&
+             isValidNumberRange(data.totalMiles, 0, 1000000) &&
+             isValidNumberRange(data.totalHours, 0, 50000) &&
+             isValidIntRange(data.totalDrives, 0, 100000) &&
+             isValidIntRange(data.safetyScore, 0, 100) &&
+             isValidIntRange(data.mechanicalHealthScore, 0, 100) &&
+             isValidPersonaTag(data.driverPersonaTag) &&
+             data.updatedAt is timestamp &&
+             data.updatedAt == request.time;
+    }
+
+    function isValidDriveSummary(data) {
+      let requiredFields = [
+        'startTimeEpochMs',
+        'distanceMeters',
+        'durationMs',
+        'safetyScore',
+        'avgRpm',
+        'mostUsedGear',
+        'clutchSlipCount',
+        'mechanicalWearScore',
+        'driverPersonaTag',
+        'vehicleFullHierarchyName'
+      ];
+      let allowedFields = [
+        'driveId',
+        'vehicleId',
+        'vehicleFullHierarchyName',
+        'vehicleCategory',
+        'placementMode',
+        'startTimeEpochMs',
+        'endTimeEpochMs',
+        'durationMs',
+        'distanceMeters',
+        'avgSpeedKmh',
+        'maxSpeedKmh',
+        'avgRpm',
+        'maxRpm',
+        'mostUsedGear',
+        'avgEngineLoadPct',
+        'clutchSlipCount',
+        'mechanicalWearScore',
+        'driverPersonaTag',
+        'hardBrakeCount',
+        'rapidAccelCount',
+        'sharpTurnCount',
+        'safetyScore',
+        'isOngoing',
+        'updatedAt'
+      ];
+      return hasOnlyAllowedFields(allowedFields) &&
+             hasRequiredFields(requiredFields) &&
+             data.startTimeEpochMs is int && data.startTimeEpochMs > 0 &&
+             isValidNumberRange(data.distanceMeters, 0, 5000000) &&
+             isValidIntRange(data.durationMs, 0, 604800000) &&
+             isValidIntRange(data.safetyScore, 0, 100) &&
+             isValidIntRange(data.avgRpm, 0, 20000) &&
+             isValidIntRange(data.mostUsedGear, 0, 10) &&
+             isValidIntRange(data.clutchSlipCount, 0, 10000) &&
+             isValidIntRange(data.mechanicalWearScore, 0, 100) &&
+             isValidPersonaTag(data.driverPersonaTag) &&
+             validStringLength('vehicleFullHierarchyName', 1, 160) &&
+             (!('driveId' in data) || (data.driveId is int && data.driveId >= 0)) &&
+             isValidOptionalString('vehicleId', 1, 80) &&
+             (!('vehicleCategory' in data) || (data.vehicleCategory is string && data.vehicleCategory in ['AUTOMOBILE', 'MOTORCYCLE'])) &&
+             (!('placementMode' in data) || (data.placementMode is string && data.placementMode in ['MOUNTED_HOLDER', 'LOOSE_CONSOLE'])) &&
+             (!('endTimeEpochMs' in data) || (data.endTimeEpochMs is int && data.endTimeEpochMs >= data.startTimeEpochMs)) &&
+             (!('avgSpeedKmh' in data) || isValidNumberRange(data.avgSpeedKmh, 0, 500)) &&
+             (!('maxSpeedKmh' in data) || isValidNumberRange(data.maxSpeedKmh, 0, 500)) &&
+             (!('maxRpm' in data) || isValidIntRange(data.maxRpm, 0, 20000)) &&
+             (!('avgEngineLoadPct' in data) || isValidNumberRange(data.avgEngineLoadPct, 0, 100)) &&
+             (!('hardBrakeCount' in data) || isValidIntRange(data.hardBrakeCount, 0, 10000)) &&
+             (!('rapidAccelCount' in data) || isValidIntRange(data.rapidAccelCount, 0, 10000)) &&
+             (!('sharpTurnCount' in data) || isValidIntRange(data.sharpTurnCount, 0, 10000)) &&
+             (!('isOngoing' in data) || data.isOngoing is bool) &&
+             (!('updatedAt' in data) || (data.updatedAt is timestamp && data.updatedAt == request.time));
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // Global & Monthly Leaderboard Collection (Non-PII public driver stats)
+    match /leaderboard/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isOwner(userId) &&
+                       isValidLeaderboardEntry(request.resource.data, userId);
+      allow update: if isOwner(userId) &&
+                       isValidLeaderboardEntry(request.resource.data, userId) &&
+                       areImmutableFieldsUnchanged(['userId']);
+      allow delete: if false;
+    }
+
+    // Private User Telemetry & Drive Summaries
+    match /users/{userId} {
+      allow read, write: if false;
+
+      match /drives/{driveId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) &&
+                         isValidDriveSummary(request.resource.data);
+        allow update: if isOwner(userId) &&
+                         isValidDriveSummary(request.resource.data) &&
+                         areImmutableFieldsUnchanged(['startTimeEpochMs', 'driveId']);
+        allow delete: if false;
+      }
+    }
+
+    // Default Deny All Other Paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

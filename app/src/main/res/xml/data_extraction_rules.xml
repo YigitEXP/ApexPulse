@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <!-- Hassas GPS rotalarının ve araç telemetri veritabanının buluta veya ADB yedeğine sızmasını engelle -->
+    <cloud-backup>
+        <exclude domain="database" path="wheelcharm_telemetry.db" />
+        <exclude domain="sharedpref" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="database" path="wheelcharm_telemetry.db" />
+    </device-transfer>
+</data-extraction-rules>
