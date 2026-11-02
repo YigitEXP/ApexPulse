@@ -30,8 +30,184 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sin
+import kotlin.math.sqrt
+
+/**
+ * Dead Reckoning (Sinyal Kaybı Toleransı) için 1-Boyutlu (1D) Kinematik Kalman Filtresi:
+ * Tünel, kapalı otopark veya kanyon gibi GPS sinyalinin koptuğu bölgelerde, doğrusal ivmeölçer
+ * ($a_{\text{lon}}$) ve jiroskop sapma hızı ($\omega_z$) verilerini entegre ederek aracın hızını ($v$)
+ * ve WGS84 koordinatlarını ($\hat{\phi}, \hat{\lambda}$) kestirmeye devam eder.
+ */
+data class DeadReckoningStepResult(
+    val estimatedSpeedMs: Double,
+    val estimatedSpeedKmh: Float,
+    val stepDistanceMeters: Double,
+    val estimatedLatitude: Double,
+    val estimatedLongitude: Double,
+    val estimatedHeadingDeg: Float,
+    val speedUncertaintyKmh: Float
+)
+
+class DeadReckoningKalmanFilter(
+    private val processNoiseQ: Double = 0.55,
+    val gpsMeasurementNoiseR: Double = 0.22,
+    val obdMeasurementNoiseR: Double = 0.08
+) {
+    companion object {
+        private const val EARTH_RADIUS_METERS = 6_371_000.0
+        private const val ACCEL_DEADBAND_MS2 = 0.12f
+        private const val ROLLING_DRAG_DECAY = 0.025
+    }
+
+    var estimatedSpeedMs: Double = 0.0
+        private set
+    var errorCovarianceP: Double = 1.0
+        private set
+    var estimatedLatitude: Double = 37.7648
+        private set
+    var estimatedLongitude: Double = 30.5566
+        private set
+    var estimatedHeadingDeg: Float = 0f
+        private set
+    private var lastTimestampMs: Long = 0L
+
+    @Synchronized
+    fun reset(
+        latitude: Double = 37.7648,
+        longitude: Double = 30.5566,
+        headingDeg: Float = 0f,
+        speedMs: Double = 0.0,
+        timestampMs: Long = System.currentTimeMillis()
+    ) {
+        estimatedLatitude = latitude
+        estimatedLongitude = longitude
+        estimatedHeadingDeg = headingDeg
+        estimatedSpeedMs = speedMs.coerceAtLeast(0.0)
+        errorCovarianceP = 0.5
+        lastTimestampMs = timestampMs
+    }
+
+    /**
+     * 1D Kalman Prediction Adımı (IMU İvmeölçer + Jiroskop Entegrasyonu):
+     * $v_{k|k-1} = v_{k-1} + a_{\text{lon}} \cdot \Delta t$
+     * $P_{k|k-1} = P_{k-1} + Q \cdot \Delta t$
+     */
+    @Synchronized
+    fun predictWithImu(
+        longitudinalAccelMs2: Float,
+        yawRateRadSec: Float,
+        timestampMs: Long
+    ): DeadReckoningStepResult {
+        if (lastTimestampMs == 0L) {
+            lastTimestampMs = timestampMs
+        }
+        val dtSec = ((timestampMs - lastTimestampMs) / 1000.0).coerceIn(0.005, 2.0)
+        lastTimestampMs = timestampMs
+
+        val effectiveAccel = if (abs(longitudinalAccelMs2) < ACCEL_DEADBAND_MS2) {
+            -ROLLING_DRAG_DECAY * estimatedSpeedMs
+        } else {
+            longitudinalAccelMs2.toDouble()
+        }
+
+        val priorSpeedMs = estimatedSpeedMs
+        estimatedSpeedMs = (priorSpeedMs + effectiveAccel * dtSec).coerceIn(0.0, 95.0)
+        errorCovarianceP = (errorCovarianceP + processNoiseQ * dtSec).coerceAtMost(64.0)
+
+        val deltaHeadingDeg = Math.toDegrees(yawRateRadSec.toDouble() * dtSec).toFloat()
+        estimatedHeadingDeg = ((estimatedHeadingDeg + deltaHeadingDeg) % 360f + 360f) % 360f
+
+        val stepMeters = ((priorSpeedMs + estimatedSpeedMs) * 0.5) * dtSec
+        if (stepMeters > 0.01) {
+            projectCoordinateDisplacement(stepMeters)
+        }
+
+        return snapshot(stepDistanceMeters = stepMeters)
+    }
+
+    /**
+     * 1D Kalman Measurement Update Adımı (GPS Doppler Hızı veya OBD-II ECU Hızı Geldiğinde):
+     * $K_k = P_{k|k-1} / (P_{k|k-1} + R)$
+     * $v_k = v_{k|k-1} + K_k \cdot (z_k - v_{k|k-1})$
+     * $P_k = (1 - K_k) \cdot P_{k|k-1}$
+     */
+    @Synchronized
+    fun updateWithMeasurement(
+        measuredSpeedMs: Double,
+        measurementNoiseR: Double = gpsMeasurementNoiseR,
+        latitude: Double? = null,
+        longitude: Double? = null,
+        headingDeg: Float? = null,
+        timestampMs: Long = System.currentTimeMillis()
+    ): DeadReckoningStepResult {
+        if (lastTimestampMs == 0L) {
+            lastTimestampMs = timestampMs
+        } else if (timestampMs > lastTimestampMs) {
+            val dtSec = ((timestampMs - lastTimestampMs) / 1000.0).coerceIn(0.0, 5.0)
+            errorCovarianceP = (errorCovarianceP + processNoiseQ * dtSec).coerceAtMost(64.0)
+            lastTimestampMs = timestampMs
+        }
+
+        val kalmanGain = errorCovarianceP / (errorCovarianceP + measurementNoiseR.coerceAtLeast(1e-4))
+        val cleanMeasurement = measuredSpeedMs.coerceIn(0.0, 95.0)
+        estimatedSpeedMs = (estimatedSpeedMs + kalmanGain * (cleanMeasurement - estimatedSpeedMs)).coerceIn(0.0, 95.0)
+        errorCovarianceP = ((1.0 - kalmanGain) * errorCovarianceP).coerceAtLeast(0.01)
+
+        if (latitude != null && longitude != null) {
+            estimatedLatitude = latitude
+            estimatedLongitude = longitude
+        }
+        if (headingDeg != null) {
+            estimatedHeadingDeg = ((headingDeg % 360f) + 360f) % 360f
+        }
+
+        return snapshot(stepDistanceMeters = 0.0)
+    }
+
+    /**
+     * Tünel içinde yalnızca OBD-II hız verisi mevcutken (GPS yokken) $\Delta t$ süresince
+     * aracın yeni koordinatını mevcut sapma açısı ($\theta$) doğrultusunda ilerletir.
+     */
+    @Synchronized
+    fun advanceDeadReckoningTrajectory(dtSec: Double): DeadReckoningStepResult {
+        val clampedDt = dtSec.coerceIn(0.1, 5.0)
+        val stepMeters = estimatedSpeedMs * clampedDt
+        if (stepMeters > 0.05) {
+            projectCoordinateDisplacement(stepMeters)
+        }
+        return snapshot(stepDistanceMeters = stepMeters)
+    }
+
+    private fun projectCoordinateDisplacement(stepMeters: Double) {
+        val headingRad = Math.toRadians(estimatedHeadingDeg.toDouble())
+        val latRad = Math.toRadians(estimatedLatitude)
+        val dLatRad = (stepMeters * cos(headingRad)) / EARTH_RADIUS_METERS
+        val cosLat = cos(latRad).coerceAtLeast(0.05)
+        val dLngRad = (stepMeters * sin(headingRad)) / (EARTH_RADIUS_METERS * cosLat)
+
+        estimatedLatitude += Math.toDegrees(dLatRad)
+        estimatedLongitude += Math.toDegrees(dLngRad)
+    }
+
+    @Synchronized
+    fun snapshot(stepDistanceMeters: Double = 0.0): DeadReckoningStepResult {
+        val speedKmh = (estimatedSpeedMs * 3.6).toFloat()
+        val uncertaintyKmh = (sqrt(errorCovarianceP) * 3.6).toFloat()
+        return DeadReckoningStepResult(
+            estimatedSpeedMs = estimatedSpeedMs,
+            estimatedSpeedKmh = if (speedKmh < 1.5f) 0f else speedKmh,
+            stepDistanceMeters = stepDistanceMeters,
+            estimatedLatitude = estimatedLatitude,
+            estimatedLongitude = estimatedLongitude,
+            estimatedHeadingDeg = estimatedHeadingDeg,
+            speedUncertaintyKmh = uncertaintyKmh
+        )
+    }
+}
 
 class HybridTelemetryService : Service(), SensorEventListener {
 
@@ -43,11 +219,13 @@ class HybridTelemetryService : Service(), SensorEventListener {
         const val ACTION_CONNECT_OBD_BLUETOOTH = "com.wheelcharm.action.CONNECT_OBD_BLUETOOTH"
         const val ACTION_CONNECT_OBD_WIFI = "com.wheelcharm.action.CONNECT_OBD_WIFI"
         const val ACTION_DISCONNECT_OBD = "com.wheelcharm.action.DISCONNECT_OBD"
+        const val ACTION_UPDATE_BATTERY_STATUS = "com.wheelcharm.action.UPDATE_BATTERY_STATUS"
 
         const val EXTRA_PLACEMENT_MODE = "extra_placement_mode"
         const val EXTRA_OBD_MAC = "extra_obd_mac"
         const val EXTRA_OBD_WIFI_HOST = "extra_obd_wifi_host"
         const val EXTRA_OBD_WIFI_PORT = "extra_obd_wifi_port"
+        const val EXTRA_BATTERY_STATUS = "extra_battery_status"
 
         private const val NOTIFICATION_CHANNEL_ID = "wheel_charm_crash_proof_channel"
         private const val NOTIFICATION_ID = 4201
@@ -56,6 +234,9 @@ class HybridTelemetryService : Service(), SensorEventListener {
         private const val CHUNK_FLUSH_INTERVAL_MS = 3 * 60 * 1000L
         private const val UI_PREVIEW_RING_CAPACITY = 120
         private const val MAX_WAKELOCK_DURATION_MS = 10 * 60 * 60 * 1000L
+
+        private const val GPS_SIGNAL_LOSS_THRESHOLD_MS = 3_500L
+        private const val MAX_DEAD_RECKONING_WINDOW_MS = 120_000L
 
         private val _telemetryState = MutableStateFlow(LiveTelemetryState())
         val telemetryState: StateFlow<LiveTelemetryState> = _telemetryState.asStateFlow()
@@ -99,8 +280,10 @@ class HybridTelemetryService : Service(), SensorEventListener {
     private var speedSamplesSum = 0.0
     private var speedSamplesCount = 0L
     private var lastValidLocation: Location? = null
+    private var lastGpsFixTimestampMs = 0L
     private var lastDynamicEventTimeMs = 0L
     private var lastClutchSlipEventTimeMs = 0L
+    private val kalmanFilter = DeadReckoningKalmanFilter()
 
     // 0-60 / 0-100 km/h Performans Kronometresi Durumu
     private var launchStartTimestampMs: Long? = null
@@ -166,13 +349,51 @@ class HybridTelemetryService : Service(), SensorEventListener {
             ACTION_CONNECT_OBD_BLUETOOTH -> {
                 val mac = intent.getStringExtra(EXTRA_OBD_MAC)
                 if (!mac.isNullOrBlank()) {
-                    obdManager.connectBluetoothWithBackoff(mac, serviceScope)
+                    serviceScope.launch {
+                        val vehicle = repository.getActiveVehicle()
+                        activeVehicle = vehicle
+                        obdManager.connectBluetoothWithBackoff(
+                            macAddress = mac,
+                            scope = serviceScope,
+                            cachedProtocolCode = vehicle?.cachedObdProtocolCode,
+                            onProtocolLocked = { lockedCode ->
+                                serviceScope.launch {
+                                    vehicle?.vehicleId?.let { vid ->
+                                        repository.cacheSuccessfulObdProtocol(vid, lockedCode)
+                                    }
+                                }
+                            }
+                        )
+                    }
                 }
             }
             ACTION_CONNECT_OBD_WIFI -> {
                 val host = intent.getStringExtra(EXTRA_OBD_WIFI_HOST) ?: Elm327ObdManager.DEFAULT_WIFI_HOST
                 val port = intent.getIntExtra(EXTRA_OBD_WIFI_PORT, Elm327ObdManager.DEFAULT_WIFI_PORT)
-                obdManager.connectWifiWithBackoff(host = host, port = port, scope = serviceScope)
+                serviceScope.launch {
+                    val vehicle = repository.getActiveVehicle()
+                    activeVehicle = vehicle
+                    obdManager.connectWifiWithBackoff(
+                        host = host,
+                        port = port,
+                        scope = serviceScope,
+                        cachedProtocolCode = vehicle?.cachedObdProtocolCode,
+                        onProtocolLocked = { lockedCode ->
+                            serviceScope.launch {
+                                vehicle?.vehicleId?.let { vid ->
+                                    repository.cacheSuccessfulObdProtocol(vid, lockedCode)
+                                }
+                            }
+                        }
+                    )
+                }
+            }
+            ACTION_UPDATE_BATTERY_STATUS -> {
+                val statusName = intent.getStringExtra(EXTRA_BATTERY_STATUS)
+                val parsed = runCatching { BatteryOptimizationStatus.valueOf(statusName ?: "") }.getOrNull()
+                if (parsed != null) {
+                    _telemetryState.update { it.copy(batteryOptimizationStatus = parsed) }
+                }
             }
             ACTION_DISCONNECT_OBD -> {
                 obdManager.disconnect()
@@ -216,6 +437,7 @@ class HybridTelemetryService : Service(), SensorEventListener {
 
         driveStartTimeMs = System.currentTimeMillis()
         lastChunkFlushTimeMs = driveStartTimeMs
+        lastGpsFixTimestampMs = driveStartTimeMs
         chunkSequenceCounter = 0
         totalDistanceMeters = 0.0
         maxSpeedKmh = 0f
@@ -228,6 +450,13 @@ class HybridTelemetryService : Service(), SensorEventListener {
         recordedZeroToHundredInRun = false
         detectedEvents.clear()
         uiPreviewRingBuffer.clear()
+        kalmanFilter.reset(
+            latitude = _telemetryState.value.currentLatitude,
+            longitude = _telemetryState.value.currentLongitude,
+            headingDeg = _telemetryState.value.currentHeadingDeg,
+            speedMs = 0.0,
+            timestampMs = driveStartTimeMs
+        )
 
         val notification = buildNotification("ApexPulse Telemetry Active (0.0 km/h)")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -265,15 +494,30 @@ class HybridTelemetryService : Service(), SensorEventListener {
                 obdConnected = _telemetryState.value.obdData.isConnected
             )
 
-            // Eğer OBD-II henüz bağlı değilse aktif aracın kayıtlı adaptörüne bağlan
+            // Eğer OBD-II henüz bağlı değilse aktif aracın kayıtlı adaptörüne Fast Init önbelleğiyle bağlan
             if (!_telemetryState.value.obdData.isConnected) {
                 activeVehicle?.let { vehicle ->
+                    val onProtocolLockedCallback: (String) -> Unit = { lockedCode ->
+                        serviceScope.launch {
+                            repository.cacheSuccessfulObdProtocol(vehicle.vehicleId, lockedCode)
+                        }
+                    }
                     when {
                         !vehicle.obdMacAddress.isNullOrBlank() -> {
-                            obdManager.connectBluetoothWithBackoff(vehicle.obdMacAddress, serviceScope)
+                            obdManager.connectBluetoothWithBackoff(
+                                macAddress = vehicle.obdMacAddress,
+                                scope = serviceScope,
+                                cachedProtocolCode = vehicle.cachedObdProtocolCode,
+                                onProtocolLocked = onProtocolLockedCallback
+                            )
                         }
                         !vehicle.obdWifiHost.isNullOrBlank() -> {
-                            obdManager.connectWifiWithBackoff(host = vehicle.obdWifiHost, scope = serviceScope)
+                            obdManager.connectWifiWithBackoff(
+                                host = vehicle.obdWifiHost,
+                                scope = serviceScope,
+                                cachedProtocolCode = vehicle.cachedObdProtocolCode,
+                                onProtocolLocked = onProtocolLockedCallback
+                            )
                         }
                     }
                 }
@@ -292,6 +536,85 @@ class HybridTelemetryService : Service(), SensorEventListener {
                     flushBufferToDatabaseIfNeeded(forceFlush = true)
                 }
             }
+        }
+
+        // Dead Reckoning (1D Kalman Filtresi Tünel / GPS Sinyal Kaybı Yedeği) Watchdog Döngüsü (1 Hz)
+        serviceScope.launch {
+            while (isActive && isSessionActive) {
+                delay(1_000L)
+                val now = System.currentTimeMillis()
+                val gpsSilenceMs = now - lastGpsFixTimestampMs
+                if (gpsSilenceMs in GPS_SIGNAL_LOSS_THRESHOLD_MS..MAX_DEAD_RECKONING_WINDOW_MS) {
+                    performDeadReckoningStep(now = now, gpsSilenceMs = gpsSilenceMs)
+                } else if (gpsSilenceMs > MAX_DEAD_RECKONING_WINDOW_MS && _telemetryState.value.isDeadReckoningActive) {
+                    _telemetryState.update { it.copy(isDeadReckoningActive = false, hasGpsFix = false) }
+                }
+            }
+        }
+    }
+
+    /**
+     * Tünel / Kapalı alanda GPS koptuğunda 1D Kalman Filtresi (IMU + varsa OBD-II ECU Hızı) ile
+     * hız ve konumu hesaplamaya devam eder.
+     */
+    private suspend fun performDeadReckoningStep(now: Long, gpsSilenceMs: Long) {
+        val obdSnapshot = _telemetryState.value.obdData
+        val drStep = if (obdSnapshot.isConnected && obdSnapshot.obdSpeedKmh >= 0f) {
+            kalmanFilter.updateWithMeasurement(
+                measuredSpeedMs = (obdSnapshot.obdSpeedKmh / 3.6),
+                measurementNoiseR = kalmanFilter.obdMeasurementNoiseR,
+                timestampMs = now
+            )
+            kalmanFilter.advanceDeadReckoningTrajectory(dtSec = 1.0)
+        } else {
+            kalmanFilter.snapshot(stepDistanceMeters = kalmanFilter.estimatedSpeedMs * 1.0)
+        }
+
+        val drSpeedKmh = drStep.estimatedSpeedKmh
+        if (drStep.stepDistanceMeters in 0.5..90.0) {
+            totalDistanceMeters += drStep.stepDistanceMeters
+        }
+        if (drSpeedKmh > maxSpeedKmh) maxSpeedKmh = drSpeedKmh
+        if (drSpeedKmh > 2.0f) {
+            speedSamplesSum += drSpeedKmh
+            speedSamplesCount++
+        }
+        val avgSpeed = if (speedSamplesCount > 0) (speedSamplesSum / speedSamplesCount).toFloat() else 0f
+
+        updatePerformanceTimer(drSpeedKmh, now)
+
+        if (drSpeedKmh >= 2.0f) {
+            val syntheticPoint = RoutePoint(
+                latitude = drStep.estimatedLatitude,
+                longitude = drStep.estimatedLongitude,
+                speedKmh = drSpeedKmh,
+                rpm = obdSnapshot.rpm,
+                engineLoadPct = obdSnapshot.engineLoadPercent,
+                throttlePct = obdSnapshot.throttlePercent,
+                estimatedGear = obdSnapshot.estimatedGear,
+                isClutchSlipping = obdSnapshot.isClutchSlipping,
+                timestampMs = now
+            )
+            appendPointAndCheckFlush(syntheticPoint)
+        }
+
+        val previewSnapshot = chunkMutex.withLock { uiPreviewRingBuffer.toList() }
+        _telemetryState.update { state ->
+            state.copy(
+                currentLatitude = drStep.estimatedLatitude,
+                currentLongitude = drStep.estimatedLongitude,
+                currentHeadingDeg = drStep.estimatedHeadingDeg,
+                hasGpsFix = false,
+                isDeadReckoningActive = true,
+                deadReckoningDurationSec = (gpsSilenceMs / 1000L).toInt(),
+                kalmanSpeedUncertaintyKmh = drStep.speedUncertaintyKmh,
+                currentSpeedKmh = drSpeedKmh,
+                averageSpeedKmh = avgSpeed,
+                maxSpeedKmh = maxSpeedKmh,
+                distanceMeters = totalDistanceMeters,
+                elapsedDurationMs = now - driveStartTimeMs,
+                recentPreviewPoints = previewSnapshot
+            )
         }
     }
 
@@ -430,6 +753,16 @@ class HybridTelemetryService : Service(), SensorEventListener {
 
         val cleanSpeedKmh = if (fusedSpeedKmh < 1.8f) 0f else fusedSpeedKmh
         val bearingDeg = if (location.hasBearing()) location.bearing else _telemetryState.value.currentHeadingDeg
+        lastGpsFixTimestampMs = System.currentTimeMillis()
+
+        val kalmanSnapshot = kalmanFilter.updateWithMeasurement(
+            measuredSpeedMs = (cleanSpeedKmh / 3.6),
+            measurementNoiseR = if (obdSnapshot.isConnected) kalmanFilter.obdMeasurementNoiseR else kalmanFilter.gpsMeasurementNoiseR,
+            latitude = location.latitude,
+            longitude = location.longitude,
+            headingDeg = bearingDeg,
+            timestampMs = location.time
+        )
 
         // 0-60 km/h ve 0-100 km/h Otomatik Performans Kronometresi (Dragy)
         updatePerformanceTimer(cleanSpeedKmh, location.time)
@@ -441,6 +774,9 @@ class HybridTelemetryService : Service(), SensorEventListener {
                     currentLongitude = location.longitude,
                     currentHeadingDeg = bearingDeg,
                     hasGpsFix = true,
+                    isDeadReckoningActive = false,
+                    deadReckoningDurationSec = 0,
+                    kalmanSpeedUncertaintyKmh = kalmanSnapshot.speedUncertaintyKmh,
                     currentSpeedKmh = cleanSpeedKmh
                 )
             }
@@ -487,6 +823,9 @@ class HybridTelemetryService : Service(), SensorEventListener {
                     currentLongitude = location.longitude,
                     currentHeadingDeg = bearingDeg,
                     hasGpsFix = true,
+                    isDeadReckoningActive = false,
+                    deadReckoningDurationSec = 0,
+                    kalmanSpeedUncertaintyKmh = kalmanSnapshot.speedUncertaintyKmh,
                     currentSpeedKmh = cleanSpeedKmh,
                     averageSpeedKmh = avgSpeed,
                     maxSpeedKmh = maxSpeedKmh,
@@ -579,6 +918,13 @@ class HybridTelemetryService : Service(), SensorEventListener {
 
                 val lateralG = filteredLinearAccel[0] / GRAVITY_EARTH
                 val longitudinalG = filteredLinearAccel[1] / GRAVITY_EARTH
+
+                // 1D Kalman Filtresi Prediction Adımını (IMU İvmeölçer + Jiroskop) Güncelle
+                kalmanFilter.predictWithImu(
+                    longitudinalAccelMs2 = filteredLinearAccel[1],
+                    yawRateRadSec = filteredGyro[2],
+                    timestampMs = System.currentTimeMillis()
+                )
 
                 _telemetryState.update { state ->
                     val perf = state.performanceMetrics

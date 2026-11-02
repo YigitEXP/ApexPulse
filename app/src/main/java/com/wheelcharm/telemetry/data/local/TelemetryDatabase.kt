@@ -2,13 +2,18 @@ package com.wheelcharm.telemetry.data.local
 
 import android.content.Context
 import androidx.room.*
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import com.wheelcharm.telemetry.domain.model.DrivingEvent
 import com.wheelcharm.telemetry.domain.model.DrivingEventType
+import com.wheelcharm.telemetry.domain.model.Elm327Protocol
 import com.wheelcharm.telemetry.domain.model.RoutePoint
 import com.wheelcharm.telemetry.domain.model.VehicleCategory
 import kotlinx.coroutines.flow.Flow
 import org.json.JSONArray
 import org.json.JSONObject
+
+typealias VehicleProfileEntity = GarageVehicleEntity
 
 @Entity(
     tableName = "garage_vehicles",
@@ -28,6 +33,8 @@ data class GarageVehicleEntity(
     val horsePower: Int = 95,
     val obdMacAddress: String? = null,
     val obdWifiHost: String? = null,
+    val cachedObdProtocolCode: String? = null, // Örn: "6" (ISO 15765-4 CAN 11bit 500k) -> Fast Init AT SP X
+    val lastObdConnectedEpochMs: Long = 0L,
     val isActiveVehicle: Boolean = false
 ) {
     val fullHierarchyName: String
@@ -38,6 +45,9 @@ data class GarageVehicleEntity(
 
     val categoryEnum: VehicleCategory
         get() = runCatching { VehicleCategory.valueOf(category) }.getOrDefault(VehicleCategory.AUTOMOBILE)
+
+    val cachedProtocolEnum: Elm327Protocol
+        get() = Elm327Protocol.fromCode(cachedObdProtocolCode)
 }
 
 /**
@@ -226,6 +236,18 @@ interface TelemetryDao {
     @Query("UPDATE garage_vehicles SET isActiveVehicle = CASE WHEN vehicleId = :selectedId THEN 1 ELSE 0 END")
     suspend fun setActiveVehicleExclusive(selectedId: String)
 
+    @Query("""
+        UPDATE garage_vehicles
+        SET cachedObdProtocolCode = :protocolCode,
+            lastObdConnectedEpochMs = :connectedAtMs
+        WHERE vehicleId = :vehicleId
+    """)
+    suspend fun updateVehicleCachedObdProtocol(
+        vehicleId: String,
+        protocolCode: String,
+        connectedAtMs: Long
+    )
+
     @Query("SELECT COUNT(*) FROM garage_vehicles")
     suspend fun getVehicleCount(): Int
 
@@ -280,7 +302,7 @@ interface TelemetryDao {
         DriveEntity::class,
         RoutePointChunkEntity::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 @TypeConverters(TelemetryTypeConverters::class)
@@ -289,6 +311,13 @@ abstract class TelemetryDatabase : RoomDatabase() {
 
     companion object {
         private const val DATABASE_NAME = "wheel_charm_telemetry_v3.db"
+
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE garage_vehicles ADD COLUMN cachedObdProtocolCode TEXT DEFAULT NULL")
+                db.execSQL("ALTER TABLE garage_vehicles ADD COLUMN lastObdConnectedEpochMs INTEGER NOT NULL DEFAULT 0")
+            }
+        }
 
         @Volatile
         private var INSTANCE: TelemetryDatabase? = null
@@ -307,6 +336,7 @@ abstract class TelemetryDatabase : RoomDatabase() {
                     DATABASE_NAME
                 )
                     .setJournalMode(JournalMode.WRITE_AHEAD_LOGGING)
+                    .addMigrations(MIGRATION_3_4)
                     .fallbackToDestructiveMigration()
                     .build()
                     .also { INSTANCE = it }

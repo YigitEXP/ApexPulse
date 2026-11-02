@@ -5,6 +5,7 @@ import com.wheelcharm.telemetry.data.local.DriveEntity
 import com.wheelcharm.telemetry.data.local.GarageVehicleEntity
 import com.wheelcharm.telemetry.data.local.TelemetryTypeConverters
 import com.wheelcharm.telemetry.data.obd.Elm327ObdManager
+import com.wheelcharm.telemetry.data.sensor.DeadReckoningKalmanFilter
 import com.wheelcharm.telemetry.domain.model.*
 import com.wheelcharm.telemetry.util.SecurityGuard
 import org.junit.Assert.*
@@ -316,6 +317,75 @@ class DriveAnalyticsEngineTest {
         assertTrue(recovered.avgRpm in 2000..2100)
         assertNull(fakeDao.findUnfinishedOngoingDrive())
     }
+
+    @Test
+    fun `deadReckoningKalmanFilter predicts velocity and coordinates in tunnel and converges on GPS recovery`() {
+        val kalman = DeadReckoningKalmanFilter()
+        val t0 = 1_730_000_000_000L
+        kalman.reset(
+            latitude = 37.7648,
+            longitude = 30.5566,
+            headingDeg = 0f, // Tam Kuzey yönü
+            speedMs = 20.0,  // 72 km/h ile tünele giriş
+            timestampMs = t0
+        )
+
+        // Tünel içinde 2 saniye boyunca +1.5 m/s^2 ivmelenme (GPS yok)
+        val step1 = kalman.predictWithImu(longitudinalAccelMs2 = 1.5f, yawRateRadSec = 0f, timestampMs = t0 + 1_000L)
+        val step2 = kalman.predictWithImu(longitudinalAccelMs2 = 1.5f, yawRateRadSec = 0f, timestampMs = t0 + 2_000L)
+
+        // 20 m/s + (1.5 * 2s) = 23.0 m/s (82.8 km/h)
+        assertEquals(23.0, step2.estimatedSpeedMs, 0.15)
+        assertEquals(82.8f, step2.estimatedSpeedKmh, 0.6f)
+        assertTrue("Latitude must advance northward during tunnel dead reckoning", step2.estimatedLatitude > 37.7648)
+        assertTrue("Step distance must be positive (~21.5m)", step1.stepDistanceMeters > 20.0 && step2.stepDistanceMeters > 21.0)
+
+        // Tünel çıkışı GPS ölçümü (25.0 m/s = 90 km/h) geldiğinde Kalman Kazancı ile yakınsamalı
+        val corrected = kalman.updateWithMeasurement(
+            measuredSpeedMs = 25.0,
+            measurementNoiseR = kalman.gpsMeasurementNoiseR,
+            latitude = 37.7660,
+            longitude = 30.5566,
+            headingDeg = 5f,
+            timestampMs = t0 + 3_000L
+        )
+        assertTrue(corrected.estimatedSpeedMs in 23.5..25.0)
+        assertEquals(37.7660, corrected.estimatedLatitude, 1e-6)
+        assertTrue(corrected.speedUncertaintyKmh < step2.speedUncertaintyKmh)
+    }
+
+    @Test
+    fun `obdFastInitCache parses ATDPN protocol codes and persists protocol in VehicleProfileEntity`() = kotlinx.coroutines.test.runTest {
+        val obd = Elm327ObdManager(bluetoothAdapter = null)
+
+        // ATDPN "A6" veya "6" -> ISO 15765-4 CAN (11 bit, 500 kbaud) -> ATSP6
+        val can11 = obd.parseProtocolNumber("A6\r>")
+        assertEquals(Elm327Protocol.ISO_15765_4_CAN_11BIT_500K, can11)
+        assertEquals("ATSP6", can11.atCommand)
+        assertTrue(SecurityGuard.isSafeObdCommand(can11.atCommand))
+        assertTrue(SecurityGuard.isSafeObdCommand("ATDPN"))
+
+        // Fast Init PID probe doğrulaması
+        assertTrue(obd.isValidPidProbeResponse("41 0C 1A F8"))
+        assertFalse(obd.isValidPidProbeResponse("UNABLE TO CONNECT"))
+        assertFalse(obd.isValidPidProbeResponse("NO DATA"))
+
+        // Room DAO üzerinden protokol önbellekleme doğrulaması
+        val fakeDao = FakeInMemoryTelemetryDao()
+        val repo = com.wheelcharm.telemetry.data.repository.TelemetryRepository(
+            dao = fakeDao,
+            analyticsEngine = engine,
+            converters = converters
+        )
+        repo.seedDefaultGarageIfNeeded()
+        val activeBefore = repo.getActiveVehicle()!!
+        assertNull(activeBefore.cachedObdProtocolCode)
+
+        repo.cacheSuccessfulObdProtocol(activeBefore.vehicleId, "6", connectedAtMs = 1_730_000_050_000L)
+        val activeAfter = repo.getActiveVehicle()!!
+        assertEquals("6", activeAfter.cachedObdProtocolCode)
+        assertEquals(Elm327Protocol.ISO_15765_4_CAN_11BIT_500K, activeAfter.cachedProtocolEnum)
+    }
 }
 
 private class FakeInMemoryTelemetryDao : com.wheelcharm.telemetry.data.local.TelemetryDao {
@@ -334,6 +404,19 @@ private class FakeInMemoryTelemetryDao : com.wheelcharm.telemetry.data.local.Tel
         val updated = vehicles.map { it.copy(isActiveVehicle = it.vehicleId == selectedId) }
         vehicles.clear()
         vehicles.addAll(updated)
+    }
+    override suspend fun updateVehicleCachedObdProtocol(
+        vehicleId: String,
+        protocolCode: String,
+        connectedAtMs: Long
+    ) {
+        val idx = vehicles.indexOfFirst { it.vehicleId == vehicleId }
+        if (idx >= 0) {
+            vehicles[idx] = vehicles[idx].copy(
+                cachedObdProtocolCode = protocolCode,
+                lastObdConnectedEpochMs = connectedAtMs
+            )
+        }
     }
     override suspend fun getVehicleCount() = vehicles.size
     override suspend fun insertDriveHeader(drive: DriveEntity): Long {

@@ -50,6 +50,12 @@ class TelemetryViewModel(
     private val _selectedWaypoint = MutableStateFlow<NavigationWaypoint?>(null)
     private val _isHudMirrored = MutableStateFlow(false)
 
+    private val _batteryOptimizationStatus = MutableStateFlow(BatteryOptimizationStatus.UNRESTRICTED)
+    val batteryOptimizationStatus: StateFlow<BatteryOptimizationStatus> = _batteryOptimizationStatus.asStateFlow()
+
+    private val _isInPipMode = MutableStateFlow(false)
+    val isInPipMode: StateFlow<Boolean> = _isInPipMode.asStateFlow()
+
     val presetWaypoints: List<NavigationWaypoint> = listOf(
         NavigationWaypoint(
             id = "wp_city_center",
@@ -192,6 +198,14 @@ class TelemetryViewModel(
 
     fun toggleHudMirrorMode() {
         _isHudMirrored.value = !_isHudMirrored.value
+    }
+
+    fun updateBatteryOptimizationStatus(status: BatteryOptimizationStatus) {
+        _batteryOptimizationStatus.value = status
+    }
+
+    fun updatePipModeState(inPip: Boolean) {
+        _isInPipMode.value = inPip
     }
 
     fun bindObdBluetoothToActiveVehicle(macAddress: String) {

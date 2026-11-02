@@ -17,9 +17,13 @@ object SecurityGuard {
 
     private val BLUETOOTH_MAC_REGEX = Regex("^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$")
 
-    // Yalnızca izin verilen salt-okunur ELM327 AT ve OBD-II Mode 01 PID komutları
+    // Yalnızca izin verilen salt-okunur ELM327 AT, Fast Init (ATSP0..9, ATDPN) ve OBD-II Mode 01 PID komutları
     private val ALLOWED_OBD_COMMANDS = setOf(
-        "ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATSP0",
+        "ATZ", "ATE0", "ATL0", "ATS0", "ATH0",
+        "ATSP0", "ATSP1", "ATSP2", "ATSP3", "ATSP4", "ATSP5", "ATSP6", "ATSP7", "ATSP8", "ATSP9",
+        "ATTP1", "ATTP2", "ATTP3", "ATTP4", "ATTP5", "ATTP6", "ATTP7", "ATTP8", "ATTP9",
+        "ATDP", "ATDPN",
+        "0100", // Supported PIDs [01-20]
         "0104", // Engine Load
         "0105", // Coolant Temp
         "010C", // RPM

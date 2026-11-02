@@ -3,6 +3,7 @@ package com.wheelcharm.telemetry.data.obd
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothSocket
+import com.wheelcharm.telemetry.domain.model.Elm327Protocol
 import com.wheelcharm.telemetry.domain.model.ObdBluetoothDeviceItem
 import com.wheelcharm.telemetry.domain.model.ObdConnectionState
 import com.wheelcharm.telemetry.domain.model.ObdLiveData
@@ -77,12 +78,18 @@ class Elm327ObdManager(
     }
 
     @SuppressLint("MissingPermission")
-    fun connectBluetoothWithBackoff(macAddress: String, scope: CoroutineScope) {
+    fun connectBluetoothWithBackoff(
+        macAddress: String,
+        scope: CoroutineScope,
+        cachedProtocolCode: String? = null,
+        onProtocolLocked: (String) -> Unit = {}
+    ) {
         if (!SecurityGuard.isValidBluetoothMac(macAddress)) {
             updateConnectionState(ObdConnectionState.Disconnected)
             return
         }
         disconnect()
+        var currentCachedProtocol = cachedProtocolCode
         _obdState.value = _obdState.value.copy(
             transportType = ObdTransportType.BLUETOOTH_SPP,
             connectedTargetLabel = macAddress.trim().uppercase()
@@ -107,7 +114,13 @@ class Elm327ObdManager(
                     inputStream = socket.inputStream
                     outputStream = socket.outputStream
 
-                    initializeElm327()
+                    initializeElm327(
+                        cachedProtocolCode = currentCachedProtocol,
+                        onProtocolLocked = { lockedCode ->
+                            currentCachedProtocol = lockedCode
+                            onProtocolLocked(lockedCode)
+                        }
+                    )
                     attempt = 0
                     startPidPollingLoop()
                 } catch (ce: CancellationException) {
@@ -132,13 +145,16 @@ class Elm327ObdManager(
     fun connectWifiWithBackoff(
         host: String = DEFAULT_WIFI_HOST,
         port: Int = DEFAULT_WIFI_PORT,
-        scope: CoroutineScope
+        scope: CoroutineScope,
+        cachedProtocolCode: String? = null,
+        onProtocolLocked: (String) -> Unit = {}
     ) {
         if (!SecurityGuard.isSafeLocalObdHost(host, port)) {
             updateConnectionState(ObdConnectionState.Disconnected)
             return
         }
         disconnect()
+        var currentCachedProtocol = cachedProtocolCode
         _obdState.value = _obdState.value.copy(
             transportType = ObdTransportType.WIFI_TCP,
             connectedTargetLabel = "${host.trim()}:$port"
@@ -159,7 +175,13 @@ class Elm327ObdManager(
                     inputStream = socket.getInputStream()
                     outputStream = socket.getOutputStream()
 
-                    initializeElm327()
+                    initializeElm327(
+                        cachedProtocolCode = currentCachedProtocol,
+                        onProtocolLocked = { lockedCode ->
+                            currentCachedProtocol = lockedCode
+                            onProtocolLocked(lockedCode)
+                        }
+                    )
                     attempt = 0
                     startPidPollingLoop()
                 } catch (ce: CancellationException) {
@@ -189,13 +211,75 @@ class Elm327ObdManager(
         return capped + jitter
     }
 
-    private suspend fun initializeElm327() {
-        val initCommands = listOf("ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATSP0")
-        for (cmd in initCommands) {
+    /**
+     * OBD-II Hızlı Bağlantı Önbelleği (Fast Init):
+     * Araç profilinde (`VehicleProfileEntity.cachedObdProtocolCode`) daha önce başarılı olmuş bir
+     * protokol (Örn: "6" -> ISO 15765-4 CAN 11bit 500k) kayıtlıysa doğrudan `ATSP6` komutu göndererek
+     * çoklu protokol tarama gecikmesini (~2.5 sn) milisaniyelere (~120 ms) düşürür.
+     * Eğer ECU önbellekteki protokole yanıt vermezse otomatik olarak `ATSP0` (Auto Search) moduna
+     * geri döner ve `ATDPN` ile tespit edilen yeni protokolü Room veritabanına yazar.
+     */
+    private suspend fun initializeElm327(
+        cachedProtocolCode: String?,
+        onProtocolLocked: (String) -> Unit
+    ) {
+        val initStartMs = System.currentTimeMillis()
+        val baseCommands = listOf("ATZ", "ATE0", "ATL0", "ATS0", "ATH0")
+        for (cmd in baseCommands) {
             sendRawCommandOrThrow(cmd)
-            delay(100)
+            delay(if (cmd == "ATZ") 90L else 20L)
         }
-        updateConnectionState(ObdConnectionState.Connected)
+
+        val targetCachedProtocol = Elm327Protocol.fromCode(cachedProtocolCode)
+        var lockedProtocol = Elm327Protocol.AUTO
+        var usedFastInit = false
+
+        if (targetCachedProtocol != Elm327Protocol.AUTO) {
+            sendRawCommandOrThrow(targetCachedProtocol.atCommand)
+            delay(15L)
+            val fastProbe = sendRawCommandOrThrow(PID_ENGINE_RPM)
+            if (isValidPidProbeResponse(fastProbe)) {
+                lockedProtocol = targetCachedProtocol
+                usedFastInit = true
+            }
+        }
+
+        if (!usedFastInit) {
+            sendRawCommandOrThrow(Elm327Protocol.AUTO.atCommand)
+            delay(60L)
+            sendRawCommandOrThrow(PID_ENGINE_RPM)
+            val dpnRaw = sendRawCommandOrThrow("ATDPN")
+            lockedProtocol = parseProtocolNumber(dpnRaw)
+            if (lockedProtocol != Elm327Protocol.AUTO) {
+                onProtocolLocked(lockedProtocol.code)
+            }
+        }
+
+        val initDurationMs = (System.currentTimeMillis() - initStartMs).coerceAtLeast(1L)
+        _obdState.value = _obdState.value.copy(
+            activeProtocolCode = lockedProtocol.code,
+            activeProtocolName = lockedProtocol.displayName,
+            lastInitDurationMs = initDurationMs,
+            usedFastInitCache = usedFastInit,
+            connectionState = ObdConnectionState.Connected,
+            timestampMs = System.currentTimeMillis()
+        )
+    }
+
+    internal fun isValidPidProbeResponse(hexResponse: String): Boolean {
+        val clean = hexResponse.filter { !it.isWhitespace() }.uppercase()
+        if (clean.isBlank()) return false
+        if (clean.contains("UNABLE") || clean.contains("ERROR") || clean.contains("NODATA") || clean.contains("STOPPED")) {
+            return false
+        }
+        return clean.contains("410C") || clean.contains("4100") || clean.contains("410D")
+    }
+
+    internal fun parseProtocolNumber(dpnResponse: String): Elm327Protocol {
+        val clean = dpnResponse.filter { !it.isWhitespace() }.uppercase()
+        // ELM327 ATDPN çıktısı otomatik aramada "A6", manuel seçimde "6" şeklinde döner
+        val candidate = clean.removePrefix("A").lastOrNull { it in '1'..'9' }?.toString()
+        return Elm327Protocol.fromCode(candidate)
     }
 
     private suspend fun CoroutineScope.startPidPollingLoop() {

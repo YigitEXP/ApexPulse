@@ -108,6 +108,58 @@ data class RoutePoint(
 )
 
 /**
+ * Android 14+ Doze Mode / Pil Optimizasyonu İstisnası Durumu.
+ */
+enum class BatteryOptimizationStatus(
+    val badgeTitle: String,
+    val description: String,
+    val isDegradedMode: Boolean
+) {
+    UNRESTRICTED(
+        badgeTitle = "Kısıtlamasız (Doze Korumalı)",
+        description = "Pil optimizasyonu devre dışı. Otonom Foreground Service Android 14+ üzerinde kesintisiz çalışır.",
+        isDegradedMode = false
+    ),
+    OPTIMIZED_NEEDS_EXEMPTION(
+        badgeTitle = "Pil Optimizasyonu Aktif",
+        description = "Arka planda kesintisiz telemetri kaydı için pil kısıtlaması istisnası önerilir.",
+        isDegradedMode = false
+    ),
+    RESTRICTED_DEGRADED_MODE(
+        badgeTitle = "Kısıtlı Mod (Degraded Mode)",
+        description = "Pil istisnası reddedildi. Uygulama yalnızca ön planda ve düşük güç örnekleme modunda çalışır.",
+        isDegradedMode = true
+    )
+}
+
+/**
+ * ELM327 Standart OBD-II Protokol Tablosu (Fast Init `AT SP X` Önbellekleme İçin).
+ */
+enum class Elm327Protocol(
+    val code: String,
+    val displayName: String,
+    val atCommand: String
+) {
+    AUTO("0", "Automatic Protocol Search", "ATSP0"),
+    SAE_J1850_PWM("1", "SAE J1850 PWM (41.6 kbaud)", "ATSP1"),
+    SAE_J1850_VPW("2", "SAE J1850 VPW (10.4 kbaud)", "ATSP2"),
+    ISO_9141_2("3", "ISO 9141-2 (5 baud init)", "ATSP3"),
+    ISO_14230_4_KWP_5BAUD("4", "ISO 14230-4 KWP (5 baud)", "ATSP4"),
+    ISO_14230_4_KWP_FAST("5", "ISO 14230-4 KWP (Fast Init)", "ATSP5"),
+    ISO_15765_4_CAN_11BIT_500K("6", "ISO 15765-4 CAN (11 bit, 500 kbaud)", "ATSP6"),
+    ISO_15765_4_CAN_29BIT_500K("7", "ISO 15765-4 CAN (29 bit, 500 kbaud)", "ATSP7"),
+    ISO_15765_4_CAN_11BIT_250K("8", "ISO 15765-4 CAN (11 bit, 250 kbaud)", "ATSP8"),
+    ISO_15765_4_CAN_29BIT_250K("9", "ISO 15765-4 CAN (29 bit, 250 kbaud)", "ATSP9");
+
+    companion object {
+        fun fromCode(code: String?): Elm327Protocol {
+            val cleaned = code?.trim()?.uppercase()?.removePrefix("A") ?: return AUTO
+            return entries.firstOrNull { it.code == cleaned } ?: AUTO
+        }
+    }
+}
+
+/**
  * OBD-II Bağlantı Türü ve Eşleşmiş Cihaz Modeli.
  */
 enum class ObdTransportType(val displayName: String) {
@@ -139,6 +191,10 @@ data class ObdLiveData(
     val isClutchSlipping: Boolean = false,// Anlık yarım debriyaj / kaçırma uyarısı
     val transportType: ObdTransportType = ObdTransportType.BLUETOOTH_SPP,
     val connectedTargetLabel: String = "",
+    val activeProtocolCode: String = "0",
+    val activeProtocolName: String = Elm327Protocol.AUTO.displayName,
+    val lastInitDurationMs: Long = 0L,
+    val usedFastInitCache: Boolean = false,
     val timestampMs: Long = System.currentTimeMillis(),
     val connectionState: ObdConnectionState = ObdConnectionState.Disconnected
 ) {
@@ -185,10 +241,14 @@ data class LiveTelemetryState(
     val isRecording: Boolean = false,
     val isAutopilotEnabled: Boolean = true,
     val placementMode: DevicePlacementMode = DevicePlacementMode.MOUNTED_HOLDER,
+    val batteryOptimizationStatus: BatteryOptimizationStatus = BatteryOptimizationStatus.UNRESTRICTED,
     val currentLatitude: Double = 37.7648,
     val currentLongitude: Double = 30.5566,
     val currentHeadingDeg: Float = 0f,
     val hasGpsFix: Boolean = false,
+    val isDeadReckoningActive: Boolean = false,
+    val deadReckoningDurationSec: Int = 0,
+    val kalmanSpeedUncertaintyKmh: Float = 0f,
     val currentSpeedKmh: Float = 0f,
     val averageSpeedKmh: Float = 0f,
     val maxSpeedKmh: Float = 0f,

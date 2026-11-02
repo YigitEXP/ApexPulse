@@ -34,6 +34,18 @@ class TelemetryRepository(
         dao.upsertVehicle(vehicle)
     }
 
+    suspend fun cacheSuccessfulObdProtocol(
+        vehicleId: String,
+        protocolCode: String,
+        connectedAtMs: Long = System.currentTimeMillis()
+    ) = withContext(Dispatchers.IO) {
+        dao.updateVehicleCachedObdProtocol(
+            vehicleId = vehicleId,
+            protocolCode = protocolCode,
+            connectedAtMs = connectedAtMs
+        )
+    }
+
     suspend fun seedDefaultGarageIfNeeded() = withContext(Dispatchers.IO) {
         if (dao.getVehicleCount() == 0) {
             val defaultVehicles = listOf(

@@ -23,8 +23,8 @@ android {
         applicationId = "com.wheelcharm.apexpulse"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0-apex"
+        versionCode = 2
+        versionName = "1.2.0-apex"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -94,7 +94,7 @@ tasks.matching { it.name == "assembleDebug" }.configureEach {
 }
 
 dependencies {
-    val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
+    val composeBom = platform("androidx.compose:compose-bom:2024.09.00")
     implementation(composeBom)
     androidTestImplementation(composeBom)
 
@@ -104,10 +104,11 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-service:2.8.3")
     implementation("androidx.activity:activity-compose:1.9.0")
 
-    // Jetpack Compose UI & Material 3 (Dark Mode + Icons)
+    // Jetpack Compose UI, Animation 1.7+ (SharedTransitionLayout) & Material 3
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.compose.animation:animation")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
 

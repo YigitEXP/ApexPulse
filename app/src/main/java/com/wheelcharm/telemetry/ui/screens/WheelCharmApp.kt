@@ -1,5 +1,6 @@
 package com.wheelcharm.telemetry.ui.screens
 
+import android.content.res.Configuration
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
@@ -27,6 +28,7 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
@@ -89,6 +91,11 @@ fun WheelCharmTelemetryApp(
     pairedObdDevices: List<ObdBluetoothDeviceItem> = emptyList(),
     presetWaypoints: List<NavigationWaypoint> = emptyList(),
     navigationState: ActiveNavigationState = ActiveNavigationState(),
+    batteryOptimizationStatus: BatteryOptimizationStatus = BatteryOptimizationStatus.UNRESTRICTED,
+    isInPipMode: Boolean = false,
+    onActiveTabChanged: (BottomNavTab) -> Unit = {},
+    onRequestBatteryExemption: () -> Unit = {},
+    onEnterPipMode: () -> Unit = {},
     onSelectVehicleFilter: (String?) -> Unit,
     onSelectSort: (DriveSortFilter) -> Unit,
     onSelectPlacementMode: (DevicePlacementMode) -> Unit,
@@ -110,9 +117,27 @@ fun WheelCharmTelemetryApp(
     onLaunchExternalTurnByTurn: (NavigationWaypoint) -> Unit = {},
     onShareTelemetrySummary: (String) -> Unit = {}
 ) {
+    // 1. Picture-in-Picture (PiP) Yüzen Pencere Modu Aktifse Yalnızca Kompakt Canlı Kokpiti Çiz
+    if (isInPipMode) {
+        PipFloatingCockpitOverlay(
+            liveState = liveTelemetry,
+            navigationState = navigationState
+        )
+        return
+    }
+
     var currentTab by remember { mutableStateOf(BottomNavTab.STATISTICS) }
     var activeWrappedStoryReport by remember { mutableStateOf<WrappedRecapReport?>(null) }
     var showObdQuickDialog by remember { mutableStateOf(false) }
+
+    val configuration = LocalConfiguration.current
+    val isAdaptiveExpandedOrLandscape =
+        configuration.orientation == Configuration.ORIENTATION_LANDSCAPE ||
+            configuration.screenWidthDp >= 600
+
+    LaunchedEffect(currentTab) {
+        onActiveTabChanged(currentTab)
+    }
 
     Box(
         modifier = Modifier
@@ -178,27 +203,50 @@ fun WheelCharmTelemetryApp(
                             onOpenNavigationTab = { currentTab = BottomNavTab.NAVIGATION }
                         )
 
-                        BottomNavTab.NAVIGATION -> NavigationAndCockpitScreen(
-                            liveState = liveTelemetry,
-                            navigationState = navigationState,
-                            presetWaypoints = presetWaypoints,
-                            onStartNavigation = onStartNavigation,
-                            onStopNavigation = onStopNavigation,
-                            onToggleHudMirror = onToggleHudMirror,
-                            onLaunchExternalTurnByTurn = onLaunchExternalTurnByTurn,
-                            onToggleRecording = onToggleRecording,
-                            onOpenObdModal = {
-                                onRefreshPairedObdDevices()
-                                showObdQuickDialog = true
+                        BottomNavTab.NAVIGATION -> {
+                            if (isAdaptiveExpandedOrLandscape) {
+                                AdaptiveLandscapeSplitCockpit(
+                                    liveState = liveTelemetry,
+                                    navigationState = navigationState,
+                                    presetWaypoints = presetWaypoints,
+                                    onStartNavigation = onStartNavigation,
+                                    onStopNavigation = onStopNavigation,
+                                    onToggleHudMirror = onToggleHudMirror,
+                                    onEnterPipMode = onEnterPipMode,
+                                    onLaunchExternalTurnByTurn = onLaunchExternalTurnByTurn,
+                                    onToggleRecording = onToggleRecording,
+                                    onOpenObdModal = {
+                                        onRefreshPairedObdDevices()
+                                        showObdQuickDialog = true
+                                    }
+                                )
+                            } else {
+                                NavigationAndCockpitScreen(
+                                    liveState = liveTelemetry,
+                                    navigationState = navigationState,
+                                    presetWaypoints = presetWaypoints,
+                                    onStartNavigation = onStartNavigation,
+                                    onStopNavigation = onStopNavigation,
+                                    onToggleHudMirror = onToggleHudMirror,
+                                    onEnterPipMode = onEnterPipMode,
+                                    onLaunchExternalTurnByTurn = onLaunchExternalTurnByTurn,
+                                    onToggleRecording = onToggleRecording,
+                                    onOpenObdModal = {
+                                        onRefreshPairedObdDevices()
+                                        showObdQuickDialog = true
+                                    }
+                                )
                             }
-                        )
+                        }
 
                         BottomNavTab.OBD_GARAGE -> GarageAndObdScreen(
                             vehicles = vehicles,
                             placementMode = placementMode,
                             isAutopilotEnabled = isAutopilotEnabled,
+                            batteryOptimizationStatus = batteryOptimizationStatus,
                             liveState = liveTelemetry,
                             pairedObdDevices = pairedObdDevices,
+                            onRequestBatteryExemption = onRequestBatteryExemption,
                             onSelectPlacementMode = onSelectPlacementMode,
                             onToggleAutopilot = onToggleAutopilot,
                             onSetActiveVehicle = onSetActiveGarageVehicle,
@@ -281,6 +329,469 @@ fun WheelCharmTelemetryApp(
 }
 
 /**
+ * PICTURE-IN-PICTURE (PiP) YÜZEN PENCERE KOKPİTİ:
+ * Kullanıcı sürüş esnasında uygulamayı arka plana attığında G-Bowl (Sürtünme Çemberi) ve
+ * Takometre / Hız / Vites göstergesini yüzen 16:9 küçük pencerede canlı akıtmaya devam eder.
+ */
+@Composable
+fun PipFloatingCockpitOverlay(
+    liveState: LiveTelemetryState,
+    navigationState: ActiveNavigationState
+) {
+    val animatedSpeed by animateFloatAsState(
+        targetValue = liveState.currentSpeedKmh,
+        animationSpec = tween(150),
+        label = "pip_speed"
+    )
+    val gearText = if (liveState.obdData.estimatedGear in 1..6) {
+        "${liveState.obdData.estimatedGear}"
+    } else {
+        "N"
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF07090C))
+            .border(1.5.dp, AccentElectricBlue.copy(alpha = 0.6f), RoundedCornerShape(12.dp))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        // Sol Bölüm: Hız, Devir, Vites ve Dead Reckoning / Navigasyon Özeti
+        Column(
+            modifier = Modifier.weight(1.15f),
+            verticalArrangement = Arrangement.Center
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Surface(
+                    color = if (liveState.obdData.isClutchSlipping) AccentDangerRed else AccentElectricBlue,
+                    shape = RoundedCornerShape(6.dp)
+                ) {
+                    Text(
+                        text = "V$gearText",
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = if (liveState.isDeadReckoningActive) "🛰️ KALMAN DR" else "⚡ APEXPULSE PiP",
+                    color = if (liveState.isDeadReckoningActive) AccentWarningOrange else AccentNeonCyan,
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+            }
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text(
+                    text = String.format(Locale.US, "%.0f", animatedSpeed),
+                    color = TextPrimaryWhite,
+                    fontSize = 30.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = "km/h",
+                    color = TextSecondaryGray,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(bottom = 4.dp)
+                )
+            }
+            Text(
+                text = "${liveState.obdData.rpm} RPM • ${String.format(Locale.US, "%+.2fG", liveState.longitudinalG)}",
+                color = TextSecondaryGray,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1
+            )
+            if (navigationState.isNavigating && navigationState.destination != null) {
+                Text(
+                    text = "🧭 ${navigationState.destination.title} (${String.format(Locale.US, "%.1f km", navigationState.distanceRemainingMeters / 1000.0)})",
+                    color = AccentNeonCyan,
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+
+        // Sağ Bölüm: Canlı G-Bowl (Sürtünme Çemberi)
+        Box(
+            modifier = Modifier
+                .weight(0.85f)
+                .fillMaxHeight(),
+            contentAlignment = Alignment.Center
+        ) {
+            GForceFrictionCircleCanvas(
+                longitudinalG = liveState.longitudinalG,
+                lateralG = liveState.lateralG,
+                modifier = Modifier.size(76.dp)
+            )
+        }
+    }
+}
+
+/**
+ * ADAPTIVE GRID (TABLET, KATLANABİLİR CİHAZ VE YATAY / LANDSCAPE MODU):
+ * Ekranı uyarlanabilir (adaptive) şekilde ikiye böler:
+ * - Sol Panel: Canlı Harita/Navigasyon yönlendirmesi, Hedef Seçici, Dead Reckoning durumu ve Dragy Kronometresi.
+ * - Sağ Panel: Takometre & Hız Kadranı, G-Bowl (Sürtünme Çemberi) ve 6-PID OBD-II Canlı Teşhis Izgarası.
+ */
+@Composable
+fun AdaptiveLandscapeSplitCockpit(
+    liveState: LiveTelemetryState,
+    navigationState: ActiveNavigationState,
+    presetWaypoints: List<NavigationWaypoint>,
+    onStartNavigation: (NavigationWaypoint) -> Unit,
+    onStopNavigation: () -> Unit,
+    onToggleHudMirror: () -> Unit,
+    onEnterPipMode: () -> Unit,
+    onLaunchExternalTurnByTurn: (NavigationWaypoint) -> Unit,
+    onToggleRecording: () -> Unit,
+    onOpenObdModal: () -> Unit
+) {
+    val animatedSpeed by animateFloatAsState(
+        targetValue = liveState.currentSpeedKmh,
+        animationSpec = spring(stiffness = Spring.StiffnessLow),
+        label = "adaptive_speed"
+    )
+    val animatedRpm by animateIntAsState(
+        targetValue = liveState.obdData.rpm,
+        animationSpec = tween(180),
+        label = "adaptive_rpm"
+    )
+
+    val hudModifier = if (navigationState.isHudMirrored) {
+        Modifier.scale(scaleX = -1f, scaleY = 1f)
+    } else {
+        Modifier
+    }
+
+    Row(
+        modifier = hudModifier
+            .fillMaxSize()
+            .padding(16.dp),
+        horizontalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        // SOL PANEL: Navigasyon, Harita Kontrolleri, 1D Kalman Dead Reckoning ve Dragy Kronometre
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxHeight()
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Adaptive Split Cockpit",
+                        color = TextPrimaryWhite,
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                    Text(
+                        text = when {
+                            liveState.isDeadReckoningActive ->
+                                "🛰️ 1D Kalman Dead Reckoning Aktif (${liveState.deadReckoningDurationSec}sn • ±${String.format(Locale.US, "%.1f", liveState.kalmanSpeedUncertaintyKmh)} km/h)"
+                            liveState.hasGpsFix ->
+                                String.format(Locale.US, "GPS Kilitli • %.4f°N, %.4f°E", liveState.currentLatitude, liveState.currentLongitude)
+                            else -> "GPS + IMU 1D Kalman Füzyonu Hazır"
+                        },
+                        color = if (liveState.isDeadReckoningActive) AccentWarningOrange else TextSecondaryGray,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Surface(
+                        color = CardDarkSurface,
+                        shape = RoundedCornerShape(50),
+                        border = BorderStroke(1.dp, AccentNeonCyan.copy(alpha = 0.45f)),
+                        modifier = Modifier.clickable { onEnterPipMode() }
+                    ) {
+                        Text(
+                            text = "📺 PiP",
+                            color = AccentNeonCyan,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                        )
+                    }
+                    Surface(
+                        color = if (navigationState.isHudMirrored) AccentNeonCyan.copy(alpha = 0.25f) else CardDarkSurface,
+                        shape = RoundedCornerShape(50),
+                        border = BorderStroke(1.dp, if (navigationState.isHudMirrored) AccentNeonCyan else Color.White.copy(alpha = 0.1f)),
+                        modifier = Modifier.clickable { onToggleHudMirror() }
+                    ) {
+                        Text(
+                            text = "🪞 HUD",
+                            color = if (navigationState.isHudMirrored) AccentNeonCyan else TextPrimaryWhite,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                        )
+                    }
+                }
+            }
+
+            if (navigationState.isNavigating && navigationState.destination != null) {
+                val dest = navigationState.destination
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(Brush.horizontalGradient(listOf(Color(0xFF063970), Color(0xFF0A84FF))))
+                        .padding(14.dp)
+                ) {
+                    Text(
+                        text = navigationState.nextManeuverText,
+                        color = Color.White,
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize = 15.sp
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = String.format(
+                            Locale.US,
+                            "Hedef: %s • Kalan: %.2f km • ETA: ~%d dk",
+                            dest.title,
+                            navigationState.distanceRemainingMeters / 1000.0,
+                            navigationState.etaMinutes
+                        ),
+                        color = Color.White.copy(alpha = 0.9f),
+                        fontSize = 12.sp
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = { onLaunchExternalTurnByTurn(dest) },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color.Black.copy(alpha = 0.35f)),
+                            shape = RoundedCornerShape(50)
+                        ) {
+                            Text("Sesli Rota", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+                        OutlinedButton(
+                            onClick = onStopNavigation,
+                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.5f)),
+                            shape = RoundedCornerShape(50)
+                        ) {
+                            Text("Durdur", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            } else {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(CardDarkSurface.copy(alpha = 0.92f))
+                        .padding(12.dp)
+                ) {
+                    Text(
+                        text = "🧭 Navigasyon Hedefi Seç (Sol Harita Paneli)",
+                        color = TextPrimaryWhite,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(presetWaypoints, key = { it.id }) { wp ->
+                            Surface(
+                                color = PillUnselectedBg,
+                                shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.08f)),
+                                modifier = Modifier.clickable { onStartNavigation(wp) }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(text = wp.categoryEmoji, fontSize = 16.sp)
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(text = wp.title, color = TextPrimaryWhite, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Dragy Kronometre Özeti
+            val perf = liveState.performanceMetrics
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                PerformanceMetricChip(
+                    title = "0-60 km/h",
+                    value = perf.bestZeroToSixtySec?.let { String.format(Locale.US, "%.2fs", it) } ?: "Hazır",
+                    accent = AccentNeonCyan,
+                    modifier = Modifier.weight(1f)
+                )
+                PerformanceMetricChip(
+                    title = "0-100 km/h",
+                    value = perf.bestZeroToHundredSec?.let { String.format(Locale.US, "%.2fs", it) } ?: "Hazır",
+                    accent = AccentGoldCrown,
+                    modifier = Modifier.weight(1f)
+                )
+                PerformanceMetricChip(
+                    title = "Zirve G",
+                    value = String.format(
+                        Locale.US,
+                        "%.2fG",
+                        maxOf(perf.peakLongitudinalAccelG, perf.peakLongitudinalBrakeG, perf.peakLateralG)
+                    ),
+                    accent = AccentEmerald,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            LiveTelemetryBanner(
+                liveState = liveState,
+                onToggleRecording = onToggleRecording
+            )
+        }
+
+        // SAĞ PANEL: G-Bowl + Takometre + OBD-II Canlı Teşhis Izgarası (Grid)
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxHeight()
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .weight(1.1f)
+                        .clip(RoundedCornerShape(22.dp))
+                        .background(CardDarkSurface.copy(alpha = 0.94f))
+                        .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(22.dp))
+                        .padding(12.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    TachometerAndSpeedGauge(
+                        speedKmh = animatedSpeed,
+                        rpm = animatedRpm,
+                        gear = liveState.obdData.estimatedGear,
+                        isClutchSlipping = liveState.obdData.isClutchSlipping
+                    )
+                }
+
+                Column(
+                    modifier = Modifier
+                        .weight(0.9f)
+                        .clip(RoundedCornerShape(22.dp))
+                        .background(CardDarkSurface.copy(alpha = 0.94f))
+                        .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(22.dp))
+                        .padding(12.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = "G-BOWL RADAR",
+                        color = TextSecondaryGray,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    GForceFrictionCircleCanvas(
+                        longitudinalG = liveState.longitudinalG,
+                        lateralG = liveState.lateralG,
+                        modifier = Modifier.size(120.dp)
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = String.format(Locale.US, "%+.2fG / %.2fG", liveState.longitudinalG, abs(liveState.lateralG)),
+                        color = TextPrimaryWhite,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            // Sağ Alt: OBD-II Canlı Teşhis Izgarası (6 PID + Fast Init Cache Durumu)
+            val obd = liveState.obdData
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(22.dp))
+                    .background(CardDarkSurface.copy(alpha = 0.94f))
+                    .border(
+                        1.dp,
+                        if (obd.isConnected) AccentEmerald.copy(alpha = 0.6f) else Color.White.copy(alpha = 0.08f),
+                        RoundedCornerShape(22.dp)
+                    )
+                    .padding(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text(
+                            text = "🔌 OBD-II Canlı Teşhis Izgarası",
+                            color = TextPrimaryWhite,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp
+                        )
+                        Text(
+                            text = if (obd.usedFastInitCache) {
+                                "⚡ Fast Init (ATSP${obd.activeProtocolCode}) • ${obd.lastInitDurationMs} ms"
+                            } else {
+                                "Protokol: ${obd.activeProtocolName}"
+                            },
+                            color = AccentNeonCyan,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    Surface(
+                        color = AccentElectricBlue.copy(alpha = 0.2f),
+                        shape = RoundedCornerShape(50),
+                        border = BorderStroke(1.dp, AccentElectricBlue),
+                        modifier = Modifier.clickable { onOpenObdModal() }
+                    ) {
+                        Text(
+                            text = if (obd.isConnected) "Bağlı" else "Cihaz Seç",
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    ObdPidMiniCard("Devir", "${obd.rpm} RPM", "010C", Modifier.weight(1f))
+                    ObdPidMiniCard("ECU Hız", "${obd.obdSpeedKmh.toInt()} km/h", "010D", Modifier.weight(1f))
+                    ObdPidMiniCard("Soğutma", "${obd.coolantTempC} °C", "0105", Modifier.weight(1f))
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    ObdPidMiniCard("Motor Yükü", "%${obd.engineLoadPercent.toInt()}", "0104", Modifier.weight(1f))
+                    ObdPidMiniCard("Gaz Kelebeği", "%${obd.throttlePercent.toInt()}", "0111", Modifier.weight(1f))
+                    val gearStr = if (obd.estimatedGear in 1..6) "${obd.estimatedGear}. Vites" else "N"
+                    ObdPidMiniCard("Vites Oranı", gearStr, String.format(Locale.US, "%.1f km/k", obd.gearRatioKmhPer1000Rpm), Modifier.weight(1f))
+                }
+            }
+        }
+    }
+}
+
+/**
  * CANLI HARİTA NAVİGASYONU, TURN-BY-TURN REHBER, G-G SÜRTÜNME DAİRESİ,
  * 0-100 KM/H DRAG KRONOMETRESİ VE ÖN CAM HUD (HEAD-UP DISPLAY) KOKPİTİ.
  */
@@ -292,6 +803,7 @@ fun NavigationAndCockpitScreen(
     onStartNavigation: (NavigationWaypoint) -> Unit,
     onStopNavigation: () -> Unit,
     onToggleHudMirror: () -> Unit,
+    onEnterPipMode: () -> Unit = {},
     onLaunchExternalTurnByTurn: (NavigationWaypoint) -> Unit,
     onToggleRecording: () -> Unit,
     onOpenObdModal: () -> Unit
@@ -326,25 +838,47 @@ fun NavigationAndCockpitScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column {
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = if (navigationState.isHudMirrored) "HUD ÖN CAM MODU" else "Navigation & Cockpit",
                         color = if (navigationState.isHudMirrored) AccentNeonCyan else TextPrimaryWhite,
-                        fontSize = 26.sp,
+                        fontSize = 24.sp,
                         fontWeight = FontWeight.ExtraBold
                     )
                     Text(
-                        text = if (liveState.hasGpsFix) {
-                            String.format(Locale.US, "GPS Aktif • %.4f°N, %.4f°E", liveState.currentLatitude, liveState.currentLongitude)
-                        } else {
-                            "GPS uydusu aranıyor • Sensör füzyonu hazır"
+                        text = when {
+                            liveState.isDeadReckoningActive ->
+                                String.format(
+                                    Locale.US,
+                                    "🛰️ 1D Kalman Dead Reckoning (%dsn • ±%.1f km/h)",
+                                    liveState.deadReckoningDurationSec,
+                                    liveState.kalmanSpeedUncertaintyKmh
+                                )
+                            liveState.hasGpsFix ->
+                                String.format(Locale.US, "GPS Aktif • %.4f°N, %.4f°E", liveState.currentLatitude, liveState.currentLongitude)
+                            else ->
+                                "GPS + 1D Kalman Dead Reckoning Hazır"
                         },
-                        color = TextSecondaryGray,
-                        fontSize = 12.sp
+                        color = if (liveState.isDeadReckoningActive) AccentWarningOrange else TextSecondaryGray,
+                        fontSize = 11.sp
                     )
                 }
 
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Surface(
+                        color = CardDarkSurface,
+                        shape = RoundedCornerShape(50),
+                        border = BorderStroke(1.dp, AccentNeonCyan.copy(alpha = 0.45f)),
+                        modifier = Modifier.clickable { onEnterPipMode() }
+                    ) {
+                        Text(
+                            text = "📺 PiP",
+                            color = AccentNeonCyan,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+                        )
+                    }
                     Surface(
                         color = if (navigationState.isHudMirrored) AccentNeonCyan.copy(alpha = 0.25f) else CardDarkSurface,
                         shape = RoundedCornerShape(50),
@@ -352,11 +886,11 @@ fun NavigationAndCockpitScreen(
                         modifier = Modifier.clickable { onToggleHudMirror() }
                     ) {
                         Text(
-                            text = if (navigationState.isHudMirrored) "HUD Kapat" else "🪞 HUD Yansıt",
+                            text = if (navigationState.isHudMirrored) "HUD Kapat" else "🪞 HUD",
                             color = if (navigationState.isHudMirrored) AccentNeonCyan else TextPrimaryWhite,
                             fontWeight = FontWeight.Bold,
-                            fontSize = 12.sp,
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
                         )
                     }
                     Surface(
@@ -366,11 +900,11 @@ fun NavigationAndCockpitScreen(
                         modifier = Modifier.clickable { onOpenObdModal() }
                     ) {
                         Text(
-                            text = if (liveState.obdData.isConnected) "🔌 OBD Bağlı" else "🔌 OBD-II Seç",
+                            text = if (liveState.obdData.isConnected) "🔌 OBD" else "🔌 OBD Seç",
                             color = if (liveState.obdData.isConnected) AccentEmerald else TextPrimaryWhite,
                             fontWeight = FontWeight.Bold,
-                            fontSize = 12.sp,
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
                         )
                     }
                 }
@@ -1458,8 +1992,10 @@ fun GarageAndObdScreen(
     vehicles: List<GarageVehicleEntity>,
     placementMode: DevicePlacementMode,
     isAutopilotEnabled: Boolean,
+    batteryOptimizationStatus: BatteryOptimizationStatus = BatteryOptimizationStatus.UNRESTRICTED,
     liveState: LiveTelemetryState,
     pairedObdDevices: List<ObdBluetoothDeviceItem>,
+    onRequestBatteryExemption: () -> Unit = {},
     onSelectPlacementMode: (DevicePlacementMode) -> Unit,
     onToggleAutopilot: (Boolean) -> Unit,
     onSetActiveVehicle: (String) -> Unit,
@@ -1481,6 +2017,54 @@ fun GarageAndObdScreen(
     ) {
         item {
             ScreenHeader(title = "OBD-II & Garage", badgeInitial = "Y", notificationCount = 1)
+        }
+
+        // Android 14+ Doze Mode Defeat (Pil Optimizasyonu İstisnası) Durum Kartı
+        item {
+            val statusColor = when (batteryOptimizationStatus) {
+                BatteryOptimizationStatus.UNRESTRICTED -> AccentEmerald
+                BatteryOptimizationStatus.OPTIMIZED_NEEDS_EXEMPTION -> AccentWarningOrange
+                BatteryOptimizationStatus.RESTRICTED_DEGRADED_MODE -> AccentDangerRed
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(22.dp))
+                    .background(CardDarkSurface)
+                    .border(1.dp, statusColor.copy(alpha = 0.6f), RoundedCornerShape(22.dp))
+                    .padding(16.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "🔋 Doze Mode & Pil Koruması: ${batteryOptimizationStatus.badgeTitle}",
+                            color = statusColor,
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize = 14.sp
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = batteryOptimizationStatus.description,
+                            color = TextSecondaryGray,
+                            fontSize = 12.sp
+                        )
+                    }
+                    if (batteryOptimizationStatus != BatteryOptimizationStatus.UNRESTRICTED) {
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Button(
+                            onClick = onRequestBatteryExemption,
+                            colors = ButtonDefaults.buttonColors(containerColor = statusColor),
+                            shape = RoundedCornerShape(50)
+                        ) {
+                            Text("İstisna Ver", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
         }
 
         // OBD-II (ELM327) Bağlantı & Canlı ECU Telemetri Kartı
@@ -1519,6 +2103,17 @@ fun GarageAndObdScreen(
                             is ObdConnectionState.Disconnected -> "Bluetooth SPP veya Wi-Fi ELM327 adaptörü seçin"
                         }
                         Text(text = sub, color = TextSecondaryGray, fontSize = 12.sp)
+                        Spacer(modifier = Modifier.height(3.dp))
+                        Text(
+                            text = if (obd.usedFastInitCache) {
+                                "⚡ Fast Init Cache Aktif: ATSP${obd.activeProtocolCode} (${obd.activeProtocolName} • ${obd.lastInitDurationMs} ms)"
+                            } else {
+                                "📡 Protokol Önbelleği: ${obd.activeProtocolName} (ATSP${obd.activeProtocolCode})"
+                            },
+                            color = AccentNeonCyan,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
                     }
                     Button(
                         onClick = {
@@ -1695,8 +2290,11 @@ fun GarageAndObdScreen(
                     )
                     val obdBinding = vehicle.obdMacAddress ?: vehicle.obdWifiHost
                     if (!obdBinding.isNullOrBlank()) {
+                        val fastInitBadge = vehicle.cachedObdProtocolCode?.let { code ->
+                            " • ⚡ Fast Init: ATSP$code (${vehicle.cachedProtocolEnum.displayName})"
+                        } ?: " • 📡 İlk bağlantıda protokol önbelleklenecek"
                         Text(
-                            text = "🔗 Kayıtlı ELM327: $obdBinding",
+                            text = "🔗 Kayıtlı ELM327: $obdBinding$fastInitBadge",
                             color = AccentElectricBlue,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.SemiBold
@@ -1835,6 +2433,12 @@ private fun AddHierarchicalVehicleDialog(
     )
 }
 
+/**
+ * DRIVES EKRANI & COMPOSE 1.7.0 SHARED ELEMENT TRANSITIONS (`SharedTransitionLayout`):
+ * Listedeki bir `DriveHistoryCard` öğesine tıklandığında `sharedBounds` ve `sharedElement`
+ * anahtarlarıyla pürüzsüzce genişleyerek tam ekran `DriveDetailExpandedScreen` görünümüne dönüşür.
+ */
+@OptIn(ExperimentalSharedTransitionApi::class)
 @Composable
 fun DrivesScreen(
     drives: List<DriveEntity>,
@@ -1849,116 +2453,151 @@ fun DrivesScreen(
     onOpenNavigationTab: () -> Unit = {}
 ) {
     var carMenuExpanded by remember { mutableStateOf(false) }
+    var selectedDriveForDetail by remember { mutableStateOf<DriveEntity?>(null) }
     val selectedCarName = vehicles.firstOrNull { it.vehicleId == selectedVehicleId }?.shortTitle ?: "All Cars"
+    val converters = remember { TelemetryTypeConverters() }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 20.dp, vertical = 22.dp)
-    ) {
-        ScreenHeader(title = "Drives", badgeInitial = "Y", notificationCount = 1)
-        Spacer(modifier = Modifier.height(16.dp))
+    SharedTransitionLayout(modifier = Modifier.fillMaxSize()) {
+        AnimatedContent(
+            targetState = selectedDriveForDetail,
+            transitionSpec = {
+                fadeIn(animationSpec = tween(320, easing = FastOutSlowInEasing))
+                    .togetherWith(fadeOut(animationSpec = tween(240)))
+            },
+            label = "drive_shared_element_transition"
+        ) { focusedDrive ->
+            if (focusedDrive != null) {
+                val points = remember(focusedDrive.previewRouteJson) {
+                    converters.toRoutePoints(focusedDrive.previewRouteJson)
+                }
+                val events = remember(focusedDrive.eventsJson) {
+                    converters.toDrivingEvents(focusedDrive.eventsJson)
+                }
+                DriveDetailExpandedScreen(
+                    drive = focusedDrive,
+                    routePoints = points,
+                    events = events,
+                    sharedTransitionScope = this@SharedTransitionLayout,
+                    animatedVisibilityScope = this@AnimatedContent,
+                    onBack = { selectedDriveForDetail = null }
+                )
+            } else {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 20.dp, vertical = 22.dp)
+                ) {
+                    ScreenHeader(title = "Drives", badgeInitial = "Y", notificationCount = 1)
+                    Spacer(modifier = Modifier.height(16.dp))
 
-        LazyRow(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            item {
-                Box {
-                    FilterChipButton(
-                        text = "$selectedCarName ▾",
-                        leadingEmoji = "🚗",
-                        isSelected = selectedVehicleId != null,
-                        onClick = { carMenuExpanded = true }
-                    )
-                    DropdownMenu(
-                        expanded = carMenuExpanded,
-                        onDismissRequest = { carMenuExpanded = false },
-                        modifier = Modifier.background(CardDarkSurface)
+                    LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        DropdownMenuItem(
-                            text = { Text("All Cars", color = TextPrimaryWhite) },
-                            onClick = {
-                                onSelectVehicle(null)
-                                carMenuExpanded = false
-                            }
-                        )
-                        vehicles.forEach { vehicle ->
-                            DropdownMenuItem(
-                                text = { Text(vehicle.fullHierarchyName, color = TextPrimaryWhite) },
-                                onClick = {
-                                    onSelectVehicle(vehicle.vehicleId)
-                                    carMenuExpanded = false
+                        item {
+                            Box {
+                                FilterChipButton(
+                                    text = "$selectedCarName ▾",
+                                    leadingEmoji = "🚗",
+                                    isSelected = selectedVehicleId != null,
+                                    onClick = { carMenuExpanded = true }
+                                )
+                                DropdownMenu(
+                                    expanded = carMenuExpanded,
+                                    onDismissRequest = { carMenuExpanded = false },
+                                    modifier = Modifier.background(CardDarkSurface)
+                                ) {
+                                    DropdownMenuItem(
+                                        text = { Text("All Cars", color = TextPrimaryWhite) },
+                                        onClick = {
+                                            onSelectVehicle(null)
+                                            carMenuExpanded = false
+                                        }
+                                    )
+                                    vehicles.forEach { vehicle ->
+                                        DropdownMenuItem(
+                                            text = { Text(vehicle.fullHierarchyName, color = TextPrimaryWhite) },
+                                            onClick = {
+                                                onSelectVehicle(vehicle.vehicleId)
+                                                carMenuExpanded = false
+                                            }
+                                        )
+                                    }
                                 }
+                            }
+                        }
+
+                        items(DriveSortFilter.entries) { filter ->
+                            FilterChipButton(
+                                text = filter.displayName,
+                                isSelected = selectedSort == filter,
+                                onClick = { onSelectSort(filter) }
+                            )
+                        }
+
+                        item {
+                            FilterChipButton(
+                                text = if (liveState.obdData.isConnected) "OBD-II Bağlı" else "OBD-II Bağla",
+                                leadingEmoji = "🔌",
+                                isSelected = liveState.obdData.isConnected,
+                                onClick = onOpenObdModal
                             )
                         }
                     }
-                }
-            }
 
-            items(DriveSortFilter.entries) { filter ->
-                FilterChipButton(
-                    text = filter.displayName,
-                    isSelected = selectedSort == filter,
-                    onClick = { onSelectSort(filter) }
-                )
-            }
+                    Spacer(modifier = Modifier.height(14.dp))
+                    LiveTelemetryBanner(liveState = liveState, onToggleRecording = onToggleRecording)
+                    Spacer(modifier = Modifier.height(14.dp))
 
-            item {
-                FilterChipButton(
-                    text = if (liveState.obdData.isConnected) "OBD-II Bağlı" else "OBD-II Bağla",
-                    leadingEmoji = "🔌",
-                    isSelected = liveState.obdData.isConnected,
-                    onClick = onOpenObdModal
-                )
-            }
-        }
-
-        Spacer(modifier = Modifier.height(14.dp))
-        LiveTelemetryBanner(liveState = liveState, onToggleRecording = onToggleRecording)
-        Spacer(modifier = Modifier.height(14.dp))
-
-        if (drives.isEmpty()) {
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth(),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    RedSportsCarVectorIllustration(modifier = Modifier.size(width = 130.dp, height = 74.dp))
-                    Spacer(modifier = Modifier.height(16.dp))
-                    Text("No drives yet", color = TextPrimaryWhite, fontSize = 24.sp, fontWeight = FontWeight.ExtraBold)
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Your completed drives will show up here.\nGo take a drive!",
-                        color = TextSecondaryGray,
-                        fontSize = 15.sp,
-                        textAlign = TextAlign.Center
-                    )
-                    Spacer(modifier = Modifier.height(20.dp))
-                    OutlinedButton(
-                        onClick = onOpenNavigationTab,
-                        border = BorderStroke(1.dp, AccentElectricBlue.copy(alpha = 0.6f)),
-                        shape = RoundedCornerShape(50)
-                    ) {
-                        Icon(Icons.Default.Navigation, contentDescription = null, tint = AccentElectricBlue, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Navigasyon & Sürüş Kokpitini Aç", color = TextPrimaryWhite, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    if (drives.isEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                RedSportsCarVectorIllustration(modifier = Modifier.size(width = 130.dp, height = 74.dp))
+                                Spacer(modifier = Modifier.height(16.dp))
+                                Text("No drives yet", color = TextPrimaryWhite, fontSize = 24.sp, fontWeight = FontWeight.ExtraBold)
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = "Your completed drives will show up here.\nGo take a drive!",
+                                    color = TextSecondaryGray,
+                                    fontSize = 15.sp,
+                                    textAlign = TextAlign.Center
+                                )
+                                Spacer(modifier = Modifier.height(20.dp))
+                                OutlinedButton(
+                                    onClick = onOpenNavigationTab,
+                                    border = BorderStroke(1.dp, AccentElectricBlue.copy(alpha = 0.6f)),
+                                    shape = RoundedCornerShape(50)
+                                ) {
+                                    Icon(Icons.Default.Navigation, contentDescription = null, tint = AccentElectricBlue, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Navigasyon & Sürüş Kokpitini Aç", color = TextPrimaryWhite, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                                }
+                            }
+                        }
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            items(drives, key = { it.driveId }) { drive ->
+                                val points = remember(drive.previewRouteJson) {
+                                    converters.toRoutePoints(drive.previewRouteJson)
+                                }
+                                DriveHistoryCard(
+                                    drive = drive,
+                                    routePoints = points,
+                                    sharedTransitionScope = this@SharedTransitionLayout,
+                                    animatedVisibilityScope = this@AnimatedContent,
+                                    onClick = { selectedDriveForDetail = drive }
+                                )
+                            }
+                        }
                     }
-                }
-            }
-        } else {
-            val converters = remember { TelemetryTypeConverters() }
-            LazyColumn(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                items(drives, key = { it.driveId }) { drive ->
-                    val points = remember(drive.previewRouteJson) {
-                        converters.toRoutePoints(drive.previewRouteJson)
-                    }
-                    DriveHistoryCard(drive = drive, routePoints = points)
                 }
             }
         }
@@ -2759,66 +3398,315 @@ private fun LiveTelemetryBanner(liveState: LiveTelemetryState, onToggleRecording
     }
 }
 
+@OptIn(ExperimentalSharedTransitionApi::class)
 @Composable
-private fun DriveHistoryCard(drive: DriveEntity, routePoints: List<RoutePoint>) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(20.dp))
-            .background(CardDarkSurface)
-            .padding(16.dp)
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(
-                text = drive.vehicleFullHierarchyName,
-                color = TextPrimaryWhite,
-                fontWeight = FontWeight.Bold,
-                fontSize = 14.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f)
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                text = String.format(Locale.US, "Safety %d%%", drive.safetyScore),
-                color = AccentEmerald,
-                fontWeight = FontWeight.Bold,
-                fontSize = 13.sp
-            )
-        }
-        Spacer(modifier = Modifier.height(8.dp))
-        RoutePolylinePreview(
-            routePoints = routePoints,
+private fun DriveHistoryCard(
+    drive: DriveEntity,
+    routePoints: List<RoutePoint>,
+    sharedTransitionScope: SharedTransitionScope,
+    animatedVisibilityScope: AnimatedVisibilityScope,
+    onClick: () -> Unit
+) {
+    with(sharedTransitionScope) {
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(90.dp)
-                .clip(RoundedCornerShape(12.dp))
-                .background(Color(0xFF0C0F14))
-        )
-        Spacer(modifier = Modifier.height(10.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween
+                .sharedBounds(
+                    sharedContentState = rememberSharedContentState(key = "drive_card_${drive.driveId}"),
+                    animatedVisibilityScope = animatedVisibilityScope,
+                    boundsTransform = { _, _ ->
+                        spring(dampingRatio = 0.82f, stiffness = 380f)
+                    }
+                )
+                .clip(RoundedCornerShape(20.dp))
+                .background(CardDarkSurface)
+                .border(1.dp, Color.White.copy(alpha = 0.07f), RoundedCornerShape(20.dp))
+                .clickable(onClick = onClick)
+                .padding(16.dp)
         ) {
-            Text(
-                text = String.format(Locale.US, "%.2f km (Max %.0f km/h)", drive.distanceMeters / 1000.0, drive.maxSpeedKmh),
-                color = TextPrimaryWhite,
-                fontWeight = FontWeight.Bold,
-                fontSize = 13.sp
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = drive.vehicleFullHierarchyName,
+                    color = TextPrimaryWhite,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .weight(1f)
+                        .sharedElement(
+                            state = rememberSharedContentState(key = "drive_title_${drive.driveId}"),
+                            animatedVisibilityScope = animatedVisibilityScope
+                        )
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = String.format(Locale.US, "Safety %d%%", drive.safetyScore),
+                    color = AccentEmerald,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 13.sp,
+                    modifier = Modifier.sharedElement(
+                        state = rememberSharedContentState(key = "drive_safety_${drive.driveId}"),
+                        animatedVisibilityScope = animatedVisibilityScope
+                    )
+                )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            RoutePolylinePreview(
+                routePoints = routePoints,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(90.dp)
+                    .sharedElement(
+                        state = rememberSharedContentState(key = "drive_map_${drive.driveId}"),
+                        animatedVisibilityScope = animatedVisibilityScope
+                    )
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Color(0xFF0C0F14))
             )
-            Text(
-                text = String.format(
-                    Locale.US,
-                    "Ort %d RPM • %d. Vites",
-                    drive.avgRpm,
-                    drive.mostUsedGear.coerceAtLeast(1)
-                ),
-                color = TextSecondaryGray,
-                fontSize = 12.sp
-            )
+            Spacer(modifier = Modifier.height(10.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = String.format(Locale.US, "%.2f km (Max %.0f km/h)", drive.distanceMeters / 1000.0, drive.maxSpeedKmh),
+                    color = TextPrimaryWhite,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 13.sp
+                )
+                Text(
+                    text = String.format(
+                        Locale.US,
+                        "Ort %d RPM • %d. Vites • Detay →",
+                        drive.avgRpm,
+                        drive.mostUsedGear.coerceAtLeast(1)
+                    ),
+                    color = AccentElectricBlue,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+    }
+}
+
+/**
+ * SHARED TRANSITION TAM EKRAN SÜRÜŞ DETAY VE TELEMETRİ ANALİZ EKRANI:
+ * `DriveHistoryCard` tıklandığında ortak elementlerin (`drive_card_`, `drive_title_`, `drive_map_`, `drive_safety_`)
+ * pürüzsüzce genişlemesiyle açılır.
+ */
+@OptIn(ExperimentalSharedTransitionApi::class)
+@Composable
+private fun DriveDetailExpandedScreen(
+    drive: DriveEntity,
+    routePoints: List<RoutePoint>,
+    events: List<DrivingEvent>,
+    sharedTransitionScope: SharedTransitionScope,
+    animatedVisibilityScope: AnimatedVisibilityScope,
+    onBack: () -> Unit
+) {
+    val persona = remember(drive.driverPersonaTag) {
+        runCatching { DriverPersonaTag.valueOf(drive.driverPersonaTag) }
+            .getOrDefault(DriverPersonaTag.SMOOTH_OPERATOR)
+    }
+    val durationMinutes = (drive.durationMs / 60_000.0).coerceAtLeast(1.0)
+    val healthScore = (100 - drive.mechanicalWearScore).coerceIn(0, 100)
+
+    with(sharedTransitionScope) {
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .sharedBounds(
+                    sharedContentState = rememberSharedContentState(key = "drive_card_${drive.driveId}"),
+                    animatedVisibilityScope = animatedVisibilityScope,
+                    boundsTransform = { _, _ ->
+                        spring(dampingRatio = 0.82f, stiffness = 380f)
+                    }
+                )
+                .padding(horizontal = 20.dp),
+            contentPadding = PaddingValues(vertical = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedButton(
+                        onClick = onBack,
+                        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.2f)),
+                        shape = RoundedCornerShape(50)
+                    ) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = "Geri", tint = Color.White, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Sürüş Listesi", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    }
+
+                    Text(
+                        text = String.format(Locale.US, "Safety %d%%", drive.safetyScore),
+                        color = AccentEmerald,
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize = 16.sp,
+                        modifier = Modifier.sharedElement(
+                            state = rememberSharedContentState(key = "drive_safety_${drive.driveId}"),
+                            animatedVisibilityScope = animatedVisibilityScope
+                        )
+                    )
+                }
+            }
+
+            item {
+                Text(
+                    text = drive.vehicleFullHierarchyName,
+                    color = TextPrimaryWhite,
+                    fontWeight = FontWeight.ExtraBold,
+                    fontSize = 22.sp,
+                    modifier = Modifier.sharedElement(
+                        state = rememberSharedContentState(key = "drive_title_${drive.driveId}"),
+                        animatedVisibilityScope = animatedVisibilityScope
+                    )
+                )
+            }
+
+            item {
+                RoutePolylinePreview(
+                    routePoints = routePoints,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(195.dp)
+                        .sharedElement(
+                            state = rememberSharedContentState(key = "drive_map_${drive.driveId}"),
+                            animatedVisibilityScope = animatedVisibilityScope
+                        )
+                        .clip(RoundedCornerShape(22.dp))
+                        .background(Color(0xFF0C0F14))
+                        .border(1.dp, AccentElectricBlue.copy(alpha = 0.35f), RoundedCornerShape(22.dp))
+                )
+            }
+
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    PerformanceMetricChip(
+                        title = "Mesafe",
+                        value = String.format(Locale.US, "%.2f km", drive.distanceMeters / 1000.0),
+                        accent = AccentNeonCyan,
+                        modifier = Modifier.weight(1f)
+                    )
+                    PerformanceMetricChip(
+                        title = "Süre",
+                        value = String.format(Locale.US, "%.0f dk", durationMinutes),
+                        accent = TextPrimaryWhite,
+                        modifier = Modifier.weight(1f)
+                    )
+                    PerformanceMetricChip(
+                        title = "Zirve Hız",
+                        value = String.format(Locale.US, "%.0f km/h", drive.maxSpeedKmh),
+                        accent = AccentGoldCrown,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+
+            item {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(22.dp))
+                        .background(CardDarkSurface)
+                        .border(1.dp, Color(persona.accentColorHex).copy(alpha = 0.5f), RoundedCornerShape(22.dp))
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "ECU & Mekanik Telemetri Raporu",
+                            color = TextPrimaryWhite,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 16.sp
+                        )
+                        Text(
+                            text = "${persona.badgeEmoji} ${persona.badgeTitle}",
+                            color = Color(persona.accentColorHex),
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize = 13.sp
+                        )
+                    }
+                    StatMetricRow("🔄", "Ortalama / Zirve Devir", "OBD-II PID 010C Analizi", "${drive.avgRpm} / ${drive.maxRpm} RPM")
+                    StatMetricRow("⚙️", "Baskın Vites & Motor Yükü", "Hız / Devir Oranı", "${drive.mostUsedGear.coerceAtLeast(1)}. Vites • %${drive.avgEngineLoadPct.toInt()} Yük")
+                    StatMetricRow("🔥", "Yarım Debriyaj (Clutch Slip)", "Baskı-Balata Sürtünme İhlali", "${drive.clutchSlipCount} Kez")
+                    StatMetricRow("🛠️", "Mekanik Sağlık Skoru", "Şanzıman & Motor Koruma", "%$healthScore")
+                }
+            }
+
+            item {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(22.dp))
+                        .background(CardDarkSurface)
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "Manevra & İhlal Kayıtları (${events.size})",
+                        color = TextPrimaryWhite,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("🛑 Ani Fren: ${drive.hardBrakeCount}", color = TextSecondaryGray, fontSize = 13.sp)
+                        Text("⚡ Ani Gaz: ${drive.rapidAccelCount}", color = TextSecondaryGray, fontSize = 13.sp)
+                        Text("↩️ Keskin Viraj: ${drive.sharpTurnCount}", color = TextSecondaryGray, fontSize = 13.sp)
+                    }
+                    events.take(8).forEach { ev ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(PillUnselectedBg)
+                                .padding(10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = ev.type.label,
+                                color = TextPrimaryWhite,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp
+                            )
+                            Text(
+                                text = String.format(
+                                    Locale.US,
+                                    "%.0f km/h • %d RPM • %.2fG",
+                                    ev.speedKmhAtEvent,
+                                    ev.rpmAtEvent,
+                                    ev.magnitudeG
+                                ),
+                                color = AccentNeonCyan,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }

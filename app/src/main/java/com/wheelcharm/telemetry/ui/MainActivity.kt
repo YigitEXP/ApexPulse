@@ -1,13 +1,19 @@
 package com.wheelcharm.telemetry.ui
 
 import android.Manifest
+import android.annotation.SuppressLint
+import android.app.PictureInPictureParams
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
+import android.util.Rational
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -23,8 +29,10 @@ import com.wheelcharm.telemetry.data.local.TelemetryDatabase
 import com.wheelcharm.telemetry.data.obd.Elm327ObdManager
 import com.wheelcharm.telemetry.data.repository.TelemetryRepository
 import com.wheelcharm.telemetry.data.sensor.HybridTelemetryService
+import com.wheelcharm.telemetry.domain.model.BatteryOptimizationStatus
 import com.wheelcharm.telemetry.domain.model.DevicePlacementMode
 import com.wheelcharm.telemetry.domain.model.NavigationWaypoint
+import com.wheelcharm.telemetry.ui.screens.BottomNavTab
 import com.wheelcharm.telemetry.ui.screens.WheelCharmTelemetryApp
 import com.wheelcharm.telemetry.ui.viewmodel.TelemetryViewModel
 
@@ -41,21 +49,45 @@ class MainActivity : ComponentActivity() {
         TelemetryViewModel.Factory(repository)
     }
 
+    @Volatile
+    private var activeTabForPip: BottomNavTab = BottomNavTab.STATISTICS
+
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { grants ->
         val fineGranted = grants[Manifest.permission.ACCESS_FINE_LOCATION] == true
         val coarseGranted = grants[Manifest.permission.ACCESS_COARSE_LOCATION] == true
         if (fineGranted || coarseGranted) {
-            if (viewModel.isAutopilotEnabled.value) {
-                autopilotManager.enableAutopilotMonitoring()
-            }
+            evaluateAndPromptBatteryOptimizationIfNeeded()
         }
         refreshPairedBluetoothAdapters()
     }
 
+    /**
+     * Android 14+ Doze Mode Defeat İzin Akışı (`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`):
+     * Kullanıcı pil kısıtlamasını kaldırırsa otonom Foreground Service tam kapasite çalışır;
+     * reddederse uygulama çökmeden Kısıtlı Modda (`RESTRICTED_DEGRADED_MODE`) çalışmaya devam eder.
+     */
+    private val batteryOptimizationLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        val ignored = isIgnoringBatteryOptimizations()
+        if (ignored) {
+            applyBatteryOptimizationStatus(BatteryOptimizationStatus.UNRESTRICTED)
+            if (viewModel.isAutopilotEnabled.value) {
+                autopilotManager.enableAutopilotMonitoring()
+            }
+        } else {
+            // Kullanıcı reddetti -> Kısıtlı Mod (Degraded Mode): Arka plan otopilot kapatılır, ön plan kaydı aktif kalır
+            applyBatteryOptimizationStatus(BatteryOptimizationStatus.RESTRICTED_DEGRADED_MODE)
+            viewModel.setAutopilotEnabled(false)
+            autopilotManager.disableAutopilotMonitoring()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        syncInitialBatteryOptimizationState()
         requestRequiredTelemetryPermissions()
         refreshPairedBluetoothAdapters()
 
@@ -85,6 +117,8 @@ class MainActivity : ComponentActivity() {
                 val liveTelemetry by viewModel.liveTelemetry.collectAsState()
                 val pairedBluetoothDevices by viewModel.pairedBluetoothDevices.collectAsState()
                 val navigationState by viewModel.activeNavigationState.collectAsState()
+                val batteryStatus by viewModel.batteryOptimizationStatus.collectAsState()
+                val isInPipMode by viewModel.isInPipMode.collectAsState()
 
                 WheelCharmTelemetryApp(
                     drives = drives,
@@ -103,6 +137,17 @@ class MainActivity : ComponentActivity() {
                     pairedObdDevices = pairedBluetoothDevices,
                     presetWaypoints = viewModel.presetWaypoints,
                     navigationState = navigationState,
+                    batteryOptimizationStatus = batteryStatus,
+                    isInPipMode = isInPipMode,
+                    onActiveTabChanged = { tab ->
+                        activeTabForPip = tab
+                        updatePipParamsForState(
+                            isRecording = liveTelemetry.isRecording,
+                            activeTab = tab
+                        )
+                    },
+                    onRequestBatteryExemption = ::launchBatteryOptimizationExemptionIntent,
+                    onEnterPipMode = ::enterCockpitPictureInPictureMode,
                     onSelectVehicleFilter = viewModel::selectVehicleFilter,
                     onSelectSort = viewModel::selectSortFilter,
                     onSelectPlacementMode = { mode ->
@@ -110,9 +155,13 @@ class MainActivity : ComponentActivity() {
                         updateServiceCalibration(mode)
                     },
                     onToggleAutopilot = { enabled ->
-                        viewModel.setAutopilotEnabled(enabled)
-                        if (enabled) autopilotManager.enableAutopilotMonitoring()
-                        else autopilotManager.disableAutopilotMonitoring()
+                        if (enabled && !isIgnoringBatteryOptimizations()) {
+                            launchBatteryOptimizationExemptionIntent()
+                        } else {
+                            viewModel.setAutopilotEnabled(enabled)
+                            if (enabled) autopilotManager.enableAutopilotMonitoring()
+                            else autopilotManager.disableAutopilotMonitoring()
+                        }
                     },
                     onSelectRecapTimeframe = viewModel::setRecapTimeframe,
                     onSetActiveGarageVehicle = viewModel::setActiveGarageVehicle,
@@ -121,9 +170,14 @@ class MainActivity : ComponentActivity() {
                     onSelectScope = viewModel::selectLeaderboardScope,
                     onSelectMetric = viewModel::selectLeaderboardMetric,
                     onToggleRecording = {
+                        val nextRecording = !liveTelemetry.isRecording
                         toggleTelemetryService(
                             currentlyRecording = liveTelemetry.isRecording,
                             placementMode = placementMode
+                        )
+                        updatePipParamsForState(
+                            isRecording = nextRecording,
+                            activeTab = activeTabForPip
                         )
                     },
                     onRefreshPairedObdDevices = ::refreshPairedBluetoothAdapters,
@@ -143,6 +197,127 @@ class MainActivity : ComponentActivity() {
                     onShareTelemetrySummary = ::shareTelemetrySummaryText
                 )
             }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (isIgnoringBatteryOptimizations() &&
+            viewModel.batteryOptimizationStatus.value != BatteryOptimizationStatus.UNRESTRICTED
+        ) {
+            applyBatteryOptimizationStatus(BatteryOptimizationStatus.UNRESTRICTED)
+        }
+    }
+
+    /**
+     * Kullanıcı sürüş esnasında veya Canlı Kokpit sekmesindeyken ana ekrana (Home) dönerse
+     * otomatik olarak Picture-in-Picture (PiP) yüzen pencere moduna geçer.
+     */
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        val shouldAutoEnterPip = viewModel.liveTelemetry.value.isRecording ||
+            activeTabForPip == BottomNavTab.NAVIGATION
+        if (shouldAutoEnterPip) {
+            enterCockpitPictureInPictureMode()
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        viewModel.updatePipModeState(isInPictureInPictureMode)
+    }
+
+    private fun buildCockpitPipParams(autoEnterEnabled: Boolean): PictureInPictureParams {
+        val builder = PictureInPictureParams.Builder()
+            .setAspectRatio(Rational(16, 9))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setAutoEnterEnabled(autoEnterEnabled)
+            builder.setSeamlessResizeEnabled(true)
+        }
+        return builder.build()
+    }
+
+    private fun updatePipParamsForState(isRecording: Boolean, activeTab: BottomNavTab) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            runCatching {
+                val shouldAutoEnter = isRecording || activeTab == BottomNavTab.NAVIGATION
+                setPictureInPictureParams(buildCockpitPipParams(autoEnterEnabled = shouldAutoEnter))
+            }
+        }
+    }
+
+    private fun enterCockpitPictureInPictureMode() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)) {
+                runCatching {
+                    val params = buildCockpitPipParams(
+                        autoEnterEnabled = viewModel.liveTelemetry.value.isRecording ||
+                            activeTabForPip == BottomNavTab.NAVIGATION
+                    )
+                    enterPictureInPictureMode(params)
+                }
+            }
+        }
+    }
+
+    private fun isIgnoringBatteryOptimizations(): Boolean {
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return true
+        return pm.isIgnoringBatteryOptimizations(packageName)
+    }
+
+    private fun syncInitialBatteryOptimizationState() {
+        val status = if (isIgnoringBatteryOptimizations()) {
+            BatteryOptimizationStatus.UNRESTRICTED
+        } else {
+            BatteryOptimizationStatus.OPTIMIZED_NEEDS_EXEMPTION
+        }
+        applyBatteryOptimizationStatus(status)
+    }
+
+    private fun evaluateAndPromptBatteryOptimizationIfNeeded() {
+        if (isIgnoringBatteryOptimizations()) {
+            applyBatteryOptimizationStatus(BatteryOptimizationStatus.UNRESTRICTED)
+            if (viewModel.isAutopilotEnabled.value) {
+                autopilotManager.enableAutopilotMonitoring()
+            }
+        } else {
+            applyBatteryOptimizationStatus(BatteryOptimizationStatus.OPTIMIZED_NEEDS_EXEMPTION)
+            launchBatteryOptimizationExemptionIntent()
+        }
+    }
+
+    @SuppressLint("BatteryLife")
+    private fun launchBatteryOptimizationExemptionIntent() {
+        if (isIgnoringBatteryOptimizations()) {
+            applyBatteryOptimizationStatus(BatteryOptimizationStatus.UNRESTRICTED)
+            return
+        }
+        runCatching {
+            val directIntent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                data = Uri.parse("package:$packageName")
+            }
+            batteryOptimizationLauncher.launch(directIntent)
+        }.onFailure {
+            runCatching {
+                val fallbackIntent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                batteryOptimizationLauncher.launch(fallbackIntent)
+            }.onFailure {
+                applyBatteryOptimizationStatus(BatteryOptimizationStatus.RESTRICTED_DEGRADED_MODE)
+            }
+        }
+    }
+
+    private fun applyBatteryOptimizationStatus(status: BatteryOptimizationStatus) {
+        viewModel.updateBatteryOptimizationStatus(status)
+        runCatching {
+            val intent = Intent(this, HybridTelemetryService::class.java).apply {
+                action = HybridTelemetryService.ACTION_UPDATE_BATTERY_STATUS
+                putExtra(HybridTelemetryService.EXTRA_BATTERY_STATUS, status.name)
+            }
+            startService(intent)
         }
     }
 
@@ -252,8 +427,8 @@ class MainActivity : ComponentActivity() {
         }
         if (missing.isNotEmpty()) {
             permissionLauncher.launch(missing.toTypedArray())
-        } else if (viewModel.isAutopilotEnabled.value) {
-            autopilotManager.enableAutopilotMonitoring()
+        } else {
+            evaluateAndPromptBatteryOptimizationIfNeeded()
         }
     }
 }
