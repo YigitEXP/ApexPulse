@@ -1,8 +1,11 @@
 package com.wheelcharm.telemetry.ui
 
 import android.Manifest
+import android.bluetooth.BluetoothManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -17,9 +20,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.core.content.ContextCompat
 import com.wheelcharm.telemetry.data.autopilot.AutopilotActivityManager
 import com.wheelcharm.telemetry.data.local.TelemetryDatabase
+import com.wheelcharm.telemetry.data.obd.Elm327ObdManager
 import com.wheelcharm.telemetry.data.repository.TelemetryRepository
 import com.wheelcharm.telemetry.data.sensor.HybridTelemetryService
 import com.wheelcharm.telemetry.domain.model.DevicePlacementMode
+import com.wheelcharm.telemetry.domain.model.NavigationWaypoint
 import com.wheelcharm.telemetry.ui.screens.WheelCharmTelemetryApp
 import com.wheelcharm.telemetry.ui.viewmodel.TelemetryViewModel
 
@@ -46,11 +51,13 @@ class MainActivity : ComponentActivity() {
                 autopilotManager.enableAutopilotMonitoring()
             }
         }
+        refreshPairedBluetoothAdapters()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestRequiredTelemetryPermissions()
+        refreshPairedBluetoothAdapters()
 
         setContent {
             val darkScheme = darkColorScheme(
@@ -76,6 +83,8 @@ class MainActivity : ComponentActivity() {
                 val scope by viewModel.leaderboardScope.collectAsState()
                 val metric by viewModel.leaderboardMetric.collectAsState()
                 val liveTelemetry by viewModel.liveTelemetry.collectAsState()
+                val pairedBluetoothDevices by viewModel.pairedBluetoothDevices.collectAsState()
+                val navigationState by viewModel.activeNavigationState.collectAsState()
 
                 WheelCharmTelemetryApp(
                     drives = drives,
@@ -91,6 +100,9 @@ class MainActivity : ComponentActivity() {
                     selectedScope = scope,
                     selectedMetric = metric,
                     liveTelemetry = liveTelemetry,
+                    pairedObdDevices = pairedBluetoothDevices,
+                    presetWaypoints = viewModel.presetWaypoints,
+                    navigationState = navigationState,
                     onSelectVehicleFilter = viewModel::selectVehicleFilter,
                     onSelectSort = viewModel::selectSortFilter,
                     onSelectPlacementMode = { mode ->
@@ -114,9 +126,81 @@ class MainActivity : ComponentActivity() {
                             placementMode = placementMode
                         )
                     },
-                    onSimulateTestDrive = viewModel::simulateTestDrive
+                    onRefreshPairedObdDevices = ::refreshPairedBluetoothAdapters,
+                    onConnectObdBluetooth = { mac ->
+                        viewModel.bindObdBluetoothToActiveVehicle(mac)
+                        connectObdBluetoothViaService(mac)
+                    },
+                    onConnectObdWifi = { host, port ->
+                        viewModel.bindObdWifiToActiveVehicle(host)
+                        connectObdWifiViaService(host, port)
+                    },
+                    onDisconnectObd = ::disconnectObdViaService,
+                    onStartNavigation = viewModel::startInAppNavigation,
+                    onStopNavigation = viewModel::stopInAppNavigation,
+                    onToggleHudMirror = viewModel::toggleHudMirrorMode,
+                    onLaunchExternalTurnByTurn = ::launchExternalTurnByTurnNavigation,
+                    onShareTelemetrySummary = ::shareTelemetrySummaryText
                 )
             }
+        }
+    }
+
+    private fun refreshPairedBluetoothAdapters() {
+        val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        val devices = Elm327ObdManager(btManager?.adapter).getPairedBluetoothDevices()
+        viewModel.updatePairedBluetoothDevices(devices)
+    }
+
+    private fun connectObdBluetoothViaService(macAddress: String) {
+        val intent = Intent(this, HybridTelemetryService::class.java).apply {
+            action = HybridTelemetryService.ACTION_CONNECT_OBD_BLUETOOTH
+            putExtra(HybridTelemetryService.EXTRA_OBD_MAC, macAddress)
+        }
+        startService(intent)
+    }
+
+    private fun connectObdWifiViaService(host: String, port: Int) {
+        val intent = Intent(this, HybridTelemetryService::class.java).apply {
+            action = HybridTelemetryService.ACTION_CONNECT_OBD_WIFI
+            putExtra(HybridTelemetryService.EXTRA_OBD_WIFI_HOST, host)
+            putExtra(HybridTelemetryService.EXTRA_OBD_WIFI_PORT, port)
+        }
+        startService(intent)
+    }
+
+    private fun disconnectObdViaService() {
+        val intent = Intent(this, HybridTelemetryService::class.java).apply {
+            action = HybridTelemetryService.ACTION_DISCONNECT_OBD
+        }
+        startService(intent)
+    }
+
+    private fun launchExternalTurnByTurnNavigation(waypoint: NavigationWaypoint) {
+        runCatching {
+            val navUri = Uri.parse("google.navigation:q=${waypoint.latitude},${waypoint.longitude}&mode=d")
+            val mapIntent = Intent(Intent.ACTION_VIEW, navUri).apply {
+                setPackage("com.google.android.apps.maps")
+            }
+            if (mapIntent.resolveActivity(packageManager) != null) {
+                startActivity(mapIntent)
+            } else {
+                val fallbackUri = Uri.parse(
+                    "geo:${waypoint.latitude},${waypoint.longitude}?q=${waypoint.latitude},${waypoint.longitude}(${Uri.encode(waypoint.title)})"
+                )
+                startActivity(Intent(Intent.ACTION_VIEW, fallbackUri))
+            }
+        }
+    }
+
+    private fun shareTelemetrySummaryText(summaryText: String) {
+        runCatching {
+            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_SUBJECT, "ApexPulse Sürüş & Telemetri Özeti")
+                putExtra(Intent.EXTRA_TEXT, summaryText)
+            }
+            startActivity(Intent.createChooser(sendIntent, "Sürüş Raporunu Paylaş"))
         }
     }
 

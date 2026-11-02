@@ -1,5 +1,6 @@
 package com.wheelcharm.telemetry.ui.viewmodel
 
+import android.location.Location
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -12,6 +13,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.util.UUID
+import kotlin.math.roundToInt
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class TelemetryViewModel(
@@ -42,7 +44,103 @@ class TelemetryViewModel(
     private val _leaderboardMetric = MutableStateFlow(LeaderboardMetric.MILES)
     val leaderboardMetric: StateFlow<LeaderboardMetric> = _leaderboardMetric.asStateFlow()
 
+    private val _pairedBluetoothDevices = MutableStateFlow<List<ObdBluetoothDeviceItem>>(emptyList())
+    val pairedBluetoothDevices: StateFlow<List<ObdBluetoothDeviceItem>> = _pairedBluetoothDevices.asStateFlow()
+
+    private val _selectedWaypoint = MutableStateFlow<NavigationWaypoint?>(null)
+    private val _isHudMirrored = MutableStateFlow(false)
+
+    val presetWaypoints: List<NavigationWaypoint> = listOf(
+        NavigationWaypoint(
+            id = "wp_city_center",
+            title = "Şehir Merkezi & Meydan",
+            subtitle = "İstiklal / Hızırbey Bulvarı",
+            categoryEmoji = "🏙️",
+            latitude = 37.7648,
+            longitude = 30.5566
+        ),
+        NavigationWaypoint(
+            id = "wp_hospital",
+            title = "Şehir Hastanesi",
+            subtitle = "Acil & Servis Koridoru",
+            categoryEmoji = "🏥",
+            latitude = 37.7812,
+            longitude = 30.5694
+        ),
+        NavigationWaypoint(
+            id = "wp_campus",
+            title = "Üniversite & Teknokent",
+            subtitle = "Batı Kampüsü Otoyol Çıkışı",
+            categoryEmoji = "🎓",
+            latitude = 37.8295,
+            longitude = 30.5262
+        ),
+        NavigationWaypoint(
+            id = "wp_mountain_pass",
+            title = "Davraz Viraj Parkuru",
+            subtitle = "Performans & Rakım Tırmanış Rotası",
+            categoryEmoji = "🏔️",
+            latitude = 37.7830,
+            longitude = 30.7460
+        ),
+        NavigationWaypoint(
+            id = "wp_fuel_service",
+            title = "Otoyol Servis & Akaryakıt",
+            subtitle = "OBD-II Diagnostik & Pit Stop Noktası",
+            categoryEmoji = "⛽",
+            latitude = 37.7950,
+            longitude = 30.5420
+        )
+    )
+
     val liveTelemetry: StateFlow<LiveTelemetryState> = HybridTelemetryService.telemetryState
+
+    val activeNavigationState: StateFlow<ActiveNavigationState> = combine(
+        liveTelemetry,
+        _selectedWaypoint,
+        _isHudMirrored
+    ) { telemetry, waypoint, hudMirrored ->
+        if (waypoint == null) {
+            ActiveNavigationState(
+                isNavigating = false,
+                destination = null,
+                isHudMirrored = hudMirrored
+            )
+        } else {
+            val results = FloatArray(2)
+            runCatching {
+                Location.distanceBetween(
+                    telemetry.currentLatitude,
+                    telemetry.currentLongitude,
+                    waypoint.latitude,
+                    waypoint.longitude,
+                    results
+                )
+            }
+            val distMeters = results[0].toDouble()
+            val bearingDeg = ((results[1] + 360f) % 360f)
+            val effectiveSpeedKmh = telemetry.currentSpeedKmh.coerceAtLeast(45f)
+            val etaMin = ((distMeters / 1000.0) / (effectiveSpeedKmh / 60.0)).roundToInt().coerceAtLeast(1)
+
+            val turnDiff = ((bearingDeg - telemetry.currentHeadingDeg + 540f) % 360f) - 180f
+            val maneuverInstruction = when {
+                distMeters < 60.0 -> "Hedefe ulaştınız: ${waypoint.title}"
+                turnDiff in -25f..25f -> "Düz devam edin • ${(distMeters / 1000.0).let { String.format(java.util.Locale.US, "%.1f km", it) }}"
+                turnDiff > 25f -> "Sağ koridora yönelin (${turnDiff.roundToInt()}°) • ${waypoint.title}"
+                else -> "Sol koridora yönelin (${kotlin.math.abs(turnDiff).roundToInt()}°) • ${waypoint.title}"
+            }
+
+            ActiveNavigationState(
+                isNavigating = true,
+                destination = waypoint,
+                distanceRemainingMeters = distMeters,
+                bearingToTargetDegrees = bearingDeg,
+                etaMinutes = etaMin,
+                nextManeuverText = maneuverInstruction,
+                isHudMirrored = hudMirrored
+            )
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ActiveNavigationState())
 
     val garageVehicles: StateFlow<List<GarageVehicleEntity>> = repository.observeGarageVehicles()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
@@ -74,9 +172,42 @@ class TelemetryViewModel(
     init {
         viewModelScope.launch {
             repository.seedDefaultGarageIfNeeded()
-            // Cihaz kapanması veya OS kill sonrası yarım kalan sürüş varsa chunk'lardan kurtar
             repository.recoverOrphanedDrivesIfNeeded(
                 isServiceCurrentlyRecording = liveTelemetry.value.isRecording
+            )
+        }
+    }
+
+    fun updatePairedBluetoothDevices(devices: List<ObdBluetoothDeviceItem>) {
+        _pairedBluetoothDevices.value = devices
+    }
+
+    fun startInAppNavigation(waypoint: NavigationWaypoint) {
+        _selectedWaypoint.value = waypoint
+    }
+
+    fun stopInAppNavigation() {
+        _selectedWaypoint.value = null
+    }
+
+    fun toggleHudMirrorMode() {
+        _isHudMirrored.value = !_isHudMirrored.value
+    }
+
+    fun bindObdBluetoothToActiveVehicle(macAddress: String) {
+        viewModelScope.launch {
+            val active = repository.getActiveVehicle() ?: return@launch
+            repository.addOrUpdateGarageVehicle(
+                active.copy(obdMacAddress = macAddress.trim().uppercase(), obdWifiHost = null)
+            )
+        }
+    }
+
+    fun bindObdWifiToActiveVehicle(wifiHost: String) {
+        viewModelScope.launch {
+            val active = repository.getActiveVehicle() ?: return@launch
+            repository.addOrUpdateGarageVehicle(
+                active.copy(obdWifiHost = wifiHost.trim(), obdMacAddress = null)
             )
         }
     }
@@ -134,16 +265,6 @@ class TelemetryViewModel(
         }
     }
 
-    /**
-     * Tek dokunuşla 2-chunk'lı gerçekçi bir sürüş simüle eder ve Room DB + Cloud'a yazar.
-     */
-    fun simulateTestDrive() {
-        viewModelScope.launch {
-            val drive = repository.simulateRealisticTestDrive()
-            repository.syncCompletedDriveToCloud(drive = drive, stats = statisticsSummary.value)
-        }
-    }
-
     fun selectLeaderboardPeriod(period: LeaderboardPeriod) {
         _leaderboardPeriod.value = period
     }
@@ -183,8 +304,8 @@ class TelemetryViewModel(
             CompetitorSeed("u6", "abir", "@abir", 1258.3, 28.7, 58.0, isFriend = false),
             CompetitorSeed(
                 id = "current_user",
-                username = "you_driver",
-                handle = "@wheelcharm_pro",
+                username = "YigitEXP",
+                handle = "@yigitexp",
                 baseMiles = userStats.totalDistanceMiles.coerceAtLeast(142.5),
                 baseHours = userStats.totalTimeHours.coerceAtLeast(4.2),
                 baseDrives = userStats.weeklyDrivesCount.toDouble().coerceAtLeast(6.0),

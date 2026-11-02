@@ -107,6 +107,20 @@ data class RoutePoint(
     val timestampMs: Long
 )
 
+/**
+ * OBD-II Bağlantı Türü ve Eşleşmiş Cihaz Modeli.
+ */
+enum class ObdTransportType(val displayName: String) {
+    BLUETOOTH_SPP("Bluetooth (SPP)"),
+    WIFI_TCP("Wi-Fi (TCP/IP)")
+}
+
+data class ObdBluetoothDeviceItem(
+    val name: String,
+    val macAddress: String,
+    val isLikelyObdAdapter: Boolean
+)
+
 sealed class ObdConnectionState {
     data object Disconnected : ObdConnectionState()
     data object Connecting : ObdConnectionState()
@@ -123,6 +137,8 @@ data class ObdLiveData(
     val estimatedGear: Int = 0,           // Hız / Devir oranından hesaplanan anlık vites (0=N, 1..6)
     val gearRatioKmhPer1000Rpm: Float = 0f,
     val isClutchSlipping: Boolean = false,// Anlık yarım debriyaj / kaçırma uyarısı
+    val transportType: ObdTransportType = ObdTransportType.BLUETOOTH_SPP,
+    val connectedTargetLabel: String = "",
     val timestampMs: Long = System.currentTimeMillis(),
     val connectionState: ObdConnectionState = ObdConnectionState.Disconnected
 ) {
@@ -130,11 +146,49 @@ data class ObdLiveData(
         get() = connectionState is ObdConnectionState.Connected
 }
 
+/**
+ * Harita ve Navigasyon Hedef Noktası (Waypoint) & Canlı Rota Rehberi.
+ */
+data class NavigationWaypoint(
+    val id: String,
+    val title: String,
+    val subtitle: String,
+    val categoryEmoji: String,
+    val latitude: Double,
+    val longitude: Double
+)
+
+data class ActiveNavigationState(
+    val isNavigating: Boolean = false,
+    val destination: NavigationWaypoint? = null,
+    val distanceRemainingMeters: Double = 0.0,
+    val bearingToTargetDegrees: Float = 0f,
+    val etaMinutes: Int = 0,
+    val nextManeuverText: String = "Hedef seçin veya haritadan rota başlatın",
+    val isHudMirrored: Boolean = false
+)
+
+/**
+ * 0-60 km/h, 0-100 km/h ve 100-0 km/h Performans & G-Kuvveti Ölçer (Dragy / Track Timer).
+ */
+data class PerformanceTelemetryMetrics(
+    val bestZeroToSixtySec: Float? = null,
+    val bestZeroToHundredSec: Float? = null,
+    val lastBrakingDistanceMeters: Float? = null,
+    val peakLongitudinalAccelG: Float = 0f,
+    val peakLongitudinalBrakeG: Float = 0f,
+    val peakLateralG: Float = 0f
+)
+
 data class LiveTelemetryState(
     val activeDriveId: Long? = null,
     val isRecording: Boolean = false,
     val isAutopilotEnabled: Boolean = true,
     val placementMode: DevicePlacementMode = DevicePlacementMode.MOUNTED_HOLDER,
+    val currentLatitude: Double = 37.7648,
+    val currentLongitude: Double = 30.5566,
+    val currentHeadingDeg: Float = 0f,
+    val hasGpsFix: Boolean = false,
     val currentSpeedKmh: Float = 0f,
     val averageSpeedKmh: Float = 0f,
     val maxSpeedKmh: Float = 0f,
@@ -146,6 +200,7 @@ data class LiveTelemetryState(
     val flushedChunksCount: Int = 0,
     val totalPersistedPointsCount: Int = 0,
     val obdData: ObdLiveData = ObdLiveData(),
+    val performanceMetrics: PerformanceTelemetryMetrics = PerformanceTelemetryMetrics(),
     val recentPreviewPoints: List<RoutePoint> = emptyList(),
     val detectedEvents: List<DrivingEvent> = emptyList()
 )

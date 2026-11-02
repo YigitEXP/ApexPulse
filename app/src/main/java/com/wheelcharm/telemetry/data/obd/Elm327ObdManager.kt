@@ -3,8 +3,10 @@ package com.wheelcharm.telemetry.data.obd
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothSocket
+import com.wheelcharm.telemetry.domain.model.ObdBluetoothDeviceItem
 import com.wheelcharm.telemetry.domain.model.ObdConnectionState
 import com.wheelcharm.telemetry.domain.model.ObdLiveData
+import com.wheelcharm.telemetry.domain.model.ObdTransportType
 import com.wheelcharm.telemetry.util.SecurityGuard
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -36,6 +38,8 @@ class Elm327ObdManager(
         private const val PID_ENGINE_RPM = "010C"
         private const val PID_VEHICLE_SPEED = "010D"
         private const val PID_THROTTLE_POS = "0111"
+
+        private val OBD_KEYWORDS = listOf("OBD", "ELM", "VGATE", "ICAR", "VEEPEAK", "KONNWEI", "CARISTA", "VLINKER", "ECU")
     }
 
     private val _obdState = MutableStateFlow(ObdLiveData())
@@ -52,14 +56,37 @@ class Elm327ObdManager(
     private var prevRatioKmhPer1000Rpm = 0f
     private var consecutiveSlipSamples = 0
 
+    /**
+     * Telefonda eşleşmiş (paired/bonded) Bluetooth cihazlarını tarar ve OBD-II / ELM327
+     * adaptörü olma ihtimali yüksek olanları listenin en üstüne taşır.
+     */
+    @SuppressLint("MissingPermission")
+    fun getPairedBluetoothDevices(): List<ObdBluetoothDeviceItem> {
+        val bonded = runCatching { bluetoothAdapter?.bondedDevices }.getOrNull() ?: emptySet()
+        return bonded.mapNotNull { device ->
+            val mac = device.address ?: return@mapNotNull null
+            val name = runCatching { device.name }.getOrNull().takeUnless { it.isNullOrBlank() } ?: "Bluetooth Cihazı"
+            val upper = name.uppercase()
+            val isObd = OBD_KEYWORDS.any { upper.contains(it) }
+            ObdBluetoothDeviceItem(
+                name = name,
+                macAddress = mac,
+                isLikelyObdAdapter = isObd
+            )
+        }.sortedWith(compareByDescending<ObdBluetoothDeviceItem> { it.isLikelyObdAdapter }.thenBy { it.name })
+    }
+
     @SuppressLint("MissingPermission")
     fun connectBluetoothWithBackoff(macAddress: String, scope: CoroutineScope) {
-        // GÜVENLİK: Geçersiz Bluetooth MAC formatını soket açmadan önce reddet
         if (!SecurityGuard.isValidBluetoothMac(macAddress)) {
             updateConnectionState(ObdConnectionState.Disconnected)
             return
         }
         disconnect()
+        _obdState.value = _obdState.value.copy(
+            transportType = ObdTransportType.BLUETOOTH_SPP,
+            connectedTargetLabel = macAddress.trim().uppercase()
+        )
         connectionSupervisorJob = scope.launch(Dispatchers.IO + SupervisorJob()) {
             var attempt = 0
             while (isActive) {
@@ -93,7 +120,7 @@ class Elm327ObdManager(
                         ObdConnectionState.Reconnecting(
                             attempt = attempt,
                             nextDelayMs = delayMs,
-                            reason = "ELM327 sinyali kesildi"
+                            reason = "ELM327 sinyali bekleniyor ($macAddress)"
                         )
                     )
                     delay(delayMs)
@@ -107,12 +134,15 @@ class Elm327ObdManager(
         port: Int = DEFAULT_WIFI_PORT,
         scope: CoroutineScope
     ) {
-        // GÜVENLİK (SSRF Koruması): Yalnızca yerel ağ (192.168.x.x / 10.x.x.x) OBD adreslerine izin ver
         if (!SecurityGuard.isSafeLocalObdHost(host, port)) {
             updateConnectionState(ObdConnectionState.Disconnected)
             return
         }
         disconnect()
+        _obdState.value = _obdState.value.copy(
+            transportType = ObdTransportType.WIFI_TCP,
+            connectedTargetLabel = "${host.trim()}:$port"
+        )
         connectionSupervisorJob = scope.launch(Dispatchers.IO + SupervisorJob()) {
             var attempt = 0
             while (isActive) {
@@ -142,7 +172,7 @@ class Elm327ObdManager(
                         ObdConnectionState.Reconnecting(
                             attempt = attempt,
                             nextDelayMs = delayMs,
-                            reason = "Wi-Fi ELM327 koptu"
+                            reason = "Wi-Fi ELM327 bekleniyor ($host:$port)"
                         )
                     )
                     delay(delayMs)
@@ -309,7 +339,6 @@ class Elm327ObdManager(
                 if (b == -1) throw IOException("Soket EOF (Bağlantı koptu)")
                 val ch = b.toChar()
                 if (ch == '>') break
-                // Yanıt tamponu taşmasını (Buffer Overflow) önlemek için 64 karakter sınırı
                 if (!ch.isWhitespace() && sb.length < 64) {
                     sb.append(ch)
                 }

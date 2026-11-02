@@ -30,6 +30,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 
 class HybridTelemetryService : Service(), SensorEventListener {
 
@@ -38,15 +40,22 @@ class HybridTelemetryService : Service(), SensorEventListener {
         const val ACTION_AUTOPILOT_START = "com.wheelcharm.action.AUTOPILOT_START"
         const val ACTION_STOP_RECORDING = "com.wheelcharm.action.STOP_RECORDING"
         const val ACTION_UPDATE_CALIBRATION = "com.wheelcharm.action.UPDATE_CALIBRATION"
+        const val ACTION_CONNECT_OBD_BLUETOOTH = "com.wheelcharm.action.CONNECT_OBD_BLUETOOTH"
+        const val ACTION_CONNECT_OBD_WIFI = "com.wheelcharm.action.CONNECT_OBD_WIFI"
+        const val ACTION_DISCONNECT_OBD = "com.wheelcharm.action.DISCONNECT_OBD"
+
         const val EXTRA_PLACEMENT_MODE = "extra_placement_mode"
+        const val EXTRA_OBD_MAC = "extra_obd_mac"
+        const val EXTRA_OBD_WIFI_HOST = "extra_obd_wifi_host"
+        const val EXTRA_OBD_WIFI_PORT = "extra_obd_wifi_port"
 
         private const val NOTIFICATION_CHANNEL_ID = "wheel_charm_crash_proof_channel"
         private const val NOTIFICATION_ID = 4201
 
         private const val CHUNK_FLUSH_POINT_LIMIT = 500
         private const val CHUNK_FLUSH_INTERVAL_MS = 3 * 60 * 1000L
-        private const val UI_PREVIEW_RING_CAPACITY = 100
-        private const val MAX_WAKELOCK_DURATION_MS = 10 * 60 * 60 * 1000L // 10 saat üst güvenlik sınırı
+        private const val UI_PREVIEW_RING_CAPACITY = 120
+        private const val MAX_WAKELOCK_DURATION_MS = 10 * 60 * 60 * 1000L
 
         private val _telemetryState = MutableStateFlow(LiveTelemetryState())
         val telemetryState: StateFlow<LiveTelemetryState> = _telemetryState.asStateFlow()
@@ -93,6 +102,11 @@ class HybridTelemetryService : Service(), SensorEventListener {
     private var lastDynamicEventTimeMs = 0L
     private var lastClutchSlipEventTimeMs = 0L
 
+    // 0-60 / 0-100 km/h Performans Kronometresi Durumu
+    private var launchStartTimestampMs: Long? = null
+    private var recordedZeroToSixtyInRun = false
+    private var recordedZeroToHundredInRun = false
+
     private val detectedEvents = CopyOnWriteArrayList<DrivingEvent>()
 
     override fun onCreate() {
@@ -104,11 +118,35 @@ class HybridTelemetryService : Service(), SensorEventListener {
         val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         obdManager = Elm327ObdManager(btManager?.adapter)
 
-        // Thread-safe Singleton DB kullanımı (MainActivity ile aynı InvalidationTracker paylaşılır)
         val db = TelemetryDatabase.getInstance(applicationContext)
         repository = TelemetryRepository(db.telemetryDao())
 
         setupLocationCallback()
+
+        // OBD-II durumunu sürekli olarak LiveTelemetryState'e yansıt
+        serviceScope.launch {
+            obdManager.obdState.collect { obdSnapshot ->
+                _telemetryState.update { it.copy(obdData = obdSnapshot) }
+
+                val nowMs = System.currentTimeMillis()
+                if (isSessionActive && obdSnapshot.isClutchSlipping && (nowMs - lastClutchSlipEventTimeMs > 4_000L)) {
+                    lastClutchSlipEventTimeMs = nowMs
+                    val loc = lastValidLocation
+                    detectedEvents.add(
+                        DrivingEvent(
+                            type = DrivingEventType.CLUTCH_SLIP,
+                            timestampMs = nowMs,
+                            latitude = loc?.latitude ?: 0.0,
+                            longitude = loc?.longitude ?: 0.0,
+                            magnitudeG = obdSnapshot.throttlePercent,
+                            speedKmhAtEvent = _telemetryState.value.currentSpeedKmh,
+                            rpmAtEvent = obdSnapshot.rpm
+                        )
+                    )
+                    _telemetryState.update { it.copy(detectedEvents = detectedEvents.toList()) }
+                }
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -125,13 +163,26 @@ class HybridTelemetryService : Service(), SensorEventListener {
             ACTION_UPDATE_CALIBRATION -> {
                 _telemetryState.update { it.copy(placementMode = currentPlacementMode) }
             }
+            ACTION_CONNECT_OBD_BLUETOOTH -> {
+                val mac = intent.getStringExtra(EXTRA_OBD_MAC)
+                if (!mac.isNullOrBlank()) {
+                    obdManager.connectBluetoothWithBackoff(mac, serviceScope)
+                }
+            }
+            ACTION_CONNECT_OBD_WIFI -> {
+                val host = intent.getStringExtra(EXTRA_OBD_WIFI_HOST) ?: Elm327ObdManager.DEFAULT_WIFI_HOST
+                val port = intent.getIntExtra(EXTRA_OBD_WIFI_PORT, Elm327ObdManager.DEFAULT_WIFI_PORT)
+                obdManager.connectWifiWithBackoff(host = host, port = port, scope = serviceScope)
+            }
+            ACTION_DISCONNECT_OBD -> {
+                obdManager.disconnect()
+            }
             ACTION_STOP_RECORDING -> stopTelemetrySession()
         }
         return START_STICKY
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        // Kullanıcı son uygulamalardan ekranı kaydırarak kapatsa bile aktif sürüş kaydı korunur
         super.onTaskRemoved(rootIntent)
     }
 
@@ -172,6 +223,9 @@ class HybridTelemetryService : Service(), SensorEventListener {
         speedSamplesCount = 0L
         lastValidLocation = null
         gravityInitialized = false
+        launchStartTimestampMs = null
+        recordedZeroToSixtyInRun = false
+        recordedZeroToHundredInRun = false
         detectedEvents.clear()
         uiPreviewRingBuffer.clear()
 
@@ -208,16 +262,19 @@ class HybridTelemetryService : Service(), SensorEventListener {
                 activeVehicleTitle = activeVehicle?.fullHierarchyName ?: "Default",
                 placementMode = currentPlacementMode.name,
                 flushedChunks = 0,
-                obdConnected = false
+                obdConnected = _telemetryState.value.obdData.isConnected
             )
 
-            activeVehicle?.let { vehicle ->
-                when {
-                    !vehicle.obdMacAddress.isNullOrBlank() -> {
-                        obdManager.connectBluetoothWithBackoff(vehicle.obdMacAddress, serviceScope)
-                    }
-                    !vehicle.obdWifiHost.isNullOrBlank() -> {
-                        obdManager.connectWifiWithBackoff(host = vehicle.obdWifiHost, scope = serviceScope)
+            // Eğer OBD-II henüz bağlı değilse aktif aracın kayıtlı adaptörüne bağlan
+            if (!_telemetryState.value.obdData.isConnected) {
+                activeVehicle?.let { vehicle ->
+                    when {
+                        !vehicle.obdMacAddress.isNullOrBlank() -> {
+                            obdManager.connectBluetoothWithBackoff(vehicle.obdMacAddress, serviceScope)
+                        }
+                        !vehicle.obdWifiHost.isNullOrBlank() -> {
+                            obdManager.connectWifiWithBackoff(host = vehicle.obdWifiHost, scope = serviceScope)
+                        }
                     }
                 }
             }
@@ -225,31 +282,6 @@ class HybridTelemetryService : Service(), SensorEventListener {
 
         registerMotionSensors()
         requestHighAccuracyLocationUpdates()
-
-        // OBD-II Canlı Telemetri + Yarım Debriyaj (Clutch Riding) Olay Kaydedici
-        serviceScope.launch {
-            obdManager.obdState.collect { obdSnapshot ->
-                _telemetryState.update { it.copy(obdData = obdSnapshot) }
-
-                val nowMs = System.currentTimeMillis()
-                if (obdSnapshot.isClutchSlipping && (nowMs - lastClutchSlipEventTimeMs > 4_000L)) {
-                    lastClutchSlipEventTimeMs = nowMs
-                    val loc = lastValidLocation
-                    detectedEvents.add(
-                        DrivingEvent(
-                            type = DrivingEventType.CLUTCH_SLIP,
-                            timestampMs = nowMs,
-                            latitude = loc?.latitude ?: 0.0,
-                            longitude = loc?.longitude ?: 0.0,
-                            magnitudeG = obdSnapshot.throttlePercent,
-                            speedKmhAtEvent = _telemetryState.value.currentSpeedKmh,
-                            rpmAtEvent = obdSnapshot.rpm
-                        )
-                    )
-                    _telemetryState.update { it.copy(detectedEvents = detectedEvents.toList()) }
-                }
-            }
-        }
 
         // Periyodik 3 Dakikalık Chunk Flush Zamanlayıcısı
         serviceScope.launch {
@@ -282,6 +314,7 @@ class HybridTelemetryService : Service(), SensorEventListener {
         val completedDriveId = activeDriveId
         val vehicleSnapshot = activeVehicle
         val placementSnapshot = currentPlacementMode
+        val preservedPerf = _telemetryState.value.performanceMetrics
 
         serviceScope.launch {
             try {
@@ -300,10 +333,17 @@ class HybridTelemetryService : Service(), SensorEventListener {
                     )
                 }
             } finally {
-                _telemetryState.value = LiveTelemetryState(
-                    isRecording = false,
-                    placementMode = placementSnapshot
-                )
+                _telemetryState.update {
+                    LiveTelemetryState(
+                        isRecording = false,
+                        placementMode = placementSnapshot,
+                        currentLatitude = it.currentLatitude,
+                        currentLongitude = it.currentLongitude,
+                        currentHeadingDeg = it.currentHeadingDeg,
+                        hasGpsFix = it.hasGpsFix,
+                        performanceMetrics = preservedPerf
+                    )
+                }
                 releaseSafeWakeLock()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -376,12 +416,7 @@ class HybridTelemetryService : Service(), SensorEventListener {
         }
     }
 
-    /**
-     * GPS + OBD-II Hibrit Nokta İşleme ve Mock GPS Güvenlik Denetimi:
-     * Sahte konum (Fake GPS / Spoofing) tespit edilirse veriyi reddeder.
-     */
     private fun processFusedLocation(location: Location) {
-        if (!isSessionActive) return
         if (SecurityGuard.isMockOrSpoofedLocation(location)) return
         if (location.hasAccuracy() && location.accuracy > 35f) return
 
@@ -394,6 +429,23 @@ class HybridTelemetryService : Service(), SensorEventListener {
         }
 
         val cleanSpeedKmh = if (fusedSpeedKmh < 1.8f) 0f else fusedSpeedKmh
+        val bearingDeg = if (location.hasBearing()) location.bearing else _telemetryState.value.currentHeadingDeg
+
+        // 0-60 km/h ve 0-100 km/h Otomatik Performans Kronometresi (Dragy)
+        updatePerformanceTimer(cleanSpeedKmh, location.time)
+
+        if (!isSessionActive) {
+            _telemetryState.update {
+                it.copy(
+                    currentLatitude = location.latitude,
+                    currentLongitude = location.longitude,
+                    currentHeadingDeg = bearingDeg,
+                    hasGpsFix = true,
+                    currentSpeedKmh = cleanSpeedKmh
+                )
+            }
+            return
+        }
 
         lastValidLocation?.let { prev ->
             val deltaSec = ((location.time - prev.time) / 1000.0).coerceAtLeast(0.1)
@@ -431,12 +483,51 @@ class HybridTelemetryService : Service(), SensorEventListener {
 
             _telemetryState.update { state ->
                 state.copy(
+                    currentLatitude = location.latitude,
+                    currentLongitude = location.longitude,
+                    currentHeadingDeg = bearingDeg,
+                    hasGpsFix = true,
                     currentSpeedKmh = cleanSpeedKmh,
                     averageSpeedKmh = avgSpeed,
                     maxSpeedKmh = maxSpeedKmh,
                     distanceMeters = totalDistanceMeters,
                     elapsedDurationMs = System.currentTimeMillis() - driveStartTimeMs,
                     recentPreviewPoints = previewSnapshot
+                )
+            }
+        }
+    }
+
+    private fun updatePerformanceTimer(speedKmh: Float, timestampMs: Long) {
+        if (speedKmh < 2.2f) {
+            launchStartTimestampMs = timestampMs
+            recordedZeroToSixtyInRun = false
+            recordedZeroToHundredInRun = false
+            return
+        }
+
+        val startMs = launchStartTimestampMs ?: return
+        val elapsedSec = (timestampMs - startMs) / 1000f
+        if (elapsedSec <= 0.2f || elapsedSec > 35f) return
+
+        if (!recordedZeroToSixtyInRun && speedKmh >= 60f) {
+            recordedZeroToSixtyInRun = true
+            _telemetryState.update { state ->
+                val curBest = state.performanceMetrics.bestZeroToSixtySec
+                val newBest = if (curBest == null) elapsedSec else min(curBest, elapsedSec)
+                state.copy(
+                    performanceMetrics = state.performanceMetrics.copy(bestZeroToSixtySec = newBest)
+                )
+            }
+        }
+
+        if (!recordedZeroToHundredInRun && speedKmh >= 100f) {
+            recordedZeroToHundredInRun = true
+            _telemetryState.update { state ->
+                val curBest = state.performanceMetrics.bestZeroToHundredSec
+                val newBest = if (curBest == null) elapsedSec else min(curBest, elapsedSec)
+                state.copy(
+                    performanceMetrics = state.performanceMetrics.copy(bestZeroToHundredSec = newBest)
                 )
             }
         }
@@ -457,8 +548,6 @@ class HybridTelemetryService : Service(), SensorEventListener {
 
         when (event.sensor.type) {
             Sensor.TYPE_LINEAR_ACCELERATION, Sensor.TYPE_ACCELEROMETER -> {
-                // Eğer cihazda sanal TYPE_LINEAR_ACCELERATION yoksa ve ham TYPE_ACCELEROMETER'a
-                // düşüldüyse, 9.81 m/s² yerçekimi vektörünü High-Pass filtre ile ayıkla:
                 val linearX: Float
                 val linearY: Float
                 val linearZ: Float
@@ -491,8 +580,18 @@ class HybridTelemetryService : Service(), SensorEventListener {
                 val lateralG = filteredLinearAccel[0] / GRAVITY_EARTH
                 val longitudinalG = filteredLinearAccel[1] / GRAVITY_EARTH
 
-                _telemetryState.update {
-                    it.copy(longitudinalG = longitudinalG, lateralG = lateralG)
+                _telemetryState.update { state ->
+                    val perf = state.performanceMetrics
+                    val updatedPerf = perf.copy(
+                        peakLongitudinalAccelG = max(perf.peakLongitudinalAccelG, max(0f, longitudinalG)),
+                        peakLongitudinalBrakeG = max(perf.peakLongitudinalBrakeG, max(0f, -longitudinalG)),
+                        peakLateralG = max(perf.peakLateralG, abs(lateralG))
+                    )
+                    state.copy(
+                        longitudinalG = longitudinalG,
+                        lateralG = lateralG,
+                        performanceMetrics = updatedPerf
+                    )
                 }
 
                 evaluateDrivingManeuvers(longitudinalG = longitudinalG, lateralG = lateralG)
